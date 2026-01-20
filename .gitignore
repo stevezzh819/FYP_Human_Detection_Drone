@@ -1,0 +1,17 @@
+.DS_Store
+.vscode/
+
+# Build outputs
+**/build/
+**/dist/
+**/out/
+
+# Environment/config artifacts
+*.env
+
+# Local docs/media
+Documents/
+*.mov
+
+# Local keys
+id_rsa.pub
