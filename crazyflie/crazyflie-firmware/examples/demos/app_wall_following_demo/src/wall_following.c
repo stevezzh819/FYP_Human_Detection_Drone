@@ -7,36 +7,9 @@
  *
  * Crazyflie control firmware
  *
- * Copyright (C) 2021 Bitcraze AB
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, in version 3.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
- *
- *
- * wall_follower.c - App layer application of the wall following demo. The crazyflie 
- * has to have the multiranger and the flowdeck version 2.
- *
- * The same wallfollowing strategy was used in the following paper:
-
- @article{mcguire2019minimal,
-  title={Minimal navigation solution for a swarm of tiny flying robots to explore an unknown environment},
-  author={McGuire, KN and De Wagter, Christophe and Tuyls, Karl and Kappen, HJ and de Croon, Guido CHE},
-  journal={Science Robotics},
-  volume={4},
-  number={35},
-  year={2019},
-  publisher={Science Robotics}
-}
-
+ * SAR Wall-Following Autopilot
+ * Logic: 5s Wall-Follow / 5s 360-degree Scan
+ * Features: Keyboard Trigger (app.start), Low Battery Auto-Land
  */
 
 #include <string.h>
@@ -44,23 +17,19 @@
 #include <stdbool.h>
 
 #include "app.h"
-
 #include "commander.h"
-
 #include "FreeRTOS.h"
 #include "task.h"
-
 #include "debug.h"
-
 #include "log.h"
 #include "param.h"
 #include <math.h>
 #include "usec_time.h"
-
 #include "wallfollowing_multiranger_onboard.h"
 
-#define DEBUG_MODULE "WALLFOLLOWING"
+#define DEBUG_MODULE "SAR_MISSION"
 
+// Helper to set velocity setpoints
 static void setVelocitySetpoint(setpoint_t *setpoint, float vx, float vy, float z, float yawrate)
 {
   setpoint->mode.z = modeAbs;
@@ -71,34 +40,31 @@ static void setVelocitySetpoint(setpoint_t *setpoint, float vx, float vy, float 
   setpoint->mode.y = modeVelocity;
   setpoint->velocity.x = vx;
   setpoint->velocity.y = vy;
-
   setpoint->velocity_body = true;
 }
 
-// States
-typedef enum
-{
-  idle,
-  lowUnlock,
-  unlocked,
-  stopping
-} StateOuterLoop;
+// States for the mission
+typedef enum { idle, searching, unlocked, stopping, scanning } StateOuterLoop;
 
 StateOuterLoop stateOuterLoop = idle;
 StateWF stateInnerLoop = forward;
 
-// Thresholds for the unlocking procedure of the top sensor of the multiranger
+// Mission Control Variables
+bool start = false;             // Triggered by Python Script (app.start)
+static float stateStartTime = 0.0f;
+static const float batteryLowThreshold = 2.8f; // Safe landing voltage
+// Change to 2.8 V (for battery level)
+
+// Thresholds for manual hand-unlock (Backup safety)
 static const uint16_t unlockThLow = 100;
 static const uint16_t unlockThHigh = 300;
 static const uint16_t stoppedTh = 500;
 
-// Handling the height setpoint
+// Flight Parameters
 static const float spHeight = 0.5f;
 static const uint16_t radius = 300;
-
-// Some wallfollowing parameters and logging
 bool goLeft = false;
-float distanceToWall = 0.5f;
+float distanceToWall = 2.0f;  // Change to 1 or 2 m; max range of the multi-ranger sensor is 4 m
 float maxForwardSpeed = 0.5f;
 
 float cmdVelX = 0.0f;
@@ -111,130 +77,144 @@ float cmdAngWDeg = 0.0f;
 
 void appMain()
 {
-  vTaskDelay(M2T(3000));
-  // Getting Logging IDs of the multiranger
+  vTaskDelay(M2T(3000)); // Wait for sensors to stabilize
+
+  // Getting Logging IDs
   logVarId_t idUp = logGetVarId("range", "up");
   logVarId_t idLeft = logGetVarId("range", "left");
   logVarId_t idRight = logGetVarId("range", "right");
   logVarId_t idFront = logGetVarId("range", "front");
-
-  // Getting the Logging IDs of the state estimates
   logVarId_t idStabilizerYaw = logGetVarId("stabilizer", "yaw");
   logVarId_t idHeightEstimate = logGetVarId("stateEstimate", "z");
+  logVarId_t idBattery = logGetVarId("pm", "vbat");
 
-  // Getting Param IDs of the deck driver initialization
+  // Getting Param IDs
   paramVarId_t idPositioningDeck = paramGetVarId("deck", "bcFlow2");
   paramVarId_t idMultiranger = paramGetVarId("deck", "bcMultiranger");
 
-  // Initialize the wall follower state machine
   wallFollowerInit(distanceToWall, maxForwardSpeed, stateInnerLoop);
-
-  // Intialize the setpoint structure
   setpoint_t setpoint;
 
-  DEBUG_PRINT("Waiting for activation ...\n");
+  DEBUG_PRINT("SAR Mission Ready. Waiting for Python 'start' command...\n");
 
   while (1)
   {
-    vTaskDelay(M2T(10));
-
-    // Check if decks are properly mounted
+    vTaskDelay(M2T(10)); // 100Hz loop
     uint8_t positioningInit = paramGetUint(idPositioningDeck);
     uint8_t multirangerInit = paramGetUint(idMultiranger);
-
-    // Get the upper range sensor value (used for startup and stopping)
     uint16_t up = logGetUint(idUp);
-
-    // Get Height estimate
     float heightEstimate = logGetFloat(idHeightEstimate);
+    float vbat = logGetFloat(idBattery);
 
-    // If the crazyflie is unlocked by the hand, continue with state machine
-    if (stateOuterLoop == unlocked)
+    // --- 1. SAFETY: AUTO-LAND ON LOW BATTERY ---
+    if (vbat < batteryLowThreshold && stateOuterLoop != idle) {
+        DEBUG_PRINT("LOW BATTERY (%.2fV)! Landing for safety.\n", (double)vbat);
+        stateOuterLoop = stopping;
+        start = false;
+    }
+
+    // --- 2. MISSION EXECUTION ---
+    float timeNow = usecTimestamp() / 1e6;
+    float timeElapsed = timeNow - stateStartTime;
+
+    // Read side sensor once
+    float sideRange = (goLeft) ? (float)logGetUint(idRight)/1000.0f : (float)logGetUint(idLeft)/1000.0f;
+    float frontRange = (float)logGetUint(idFront)/1000.0f;
+    const float sideValidMin = 0.1f;
+    const float sideValidMax = 4.0f;
+    bool wallDetected = ((sideRange >= sideValidMin && sideRange <= sideValidMax) ||
+                     (frontRange >= sideValidMin && frontRange <= sideValidMax));
+    if (stateOuterLoop == searching && start)
     {
+      // Move forward at constant speed until wall detected
+      // cmdVelX = 0.2f;       // forward speed
+      cmdVelX = maxForwardSpeed;  // forward speed
+      cmdVelY = 0.0f;       // no lateral motion
+      cmdAngWDeg = 0.0f;    // no rotation
 
-      // Get all multiranger values
-      float frontRange = (float)logGetUint(idFront) / 1000.0f;
-      float sideRange;
-      if (goLeft)
-      {
-        sideRange = (float)logGetUint(idRight) / 1000.0f;
-      }
-      else
-      {
-        sideRange = (float)logGetUint(idLeft) / 1000.0f;
+      // Check if wall is detected
+      if (wallDetected) {
+          stateOuterLoop = unlocked;           // start wall-following
+          stateStartTime = timeNow;
+          DEBUG_PRINT("Wall detected! Starting 5s wall-following.\n");
       }
 
-      // Get the heading and convert it to rad
+      // Apply setpoint
+      setVelocitySetpoint(&setpoint, cmdVelX, cmdVelY, spHeight, cmdAngWDeg);
+      commanderSetSetpoint(&setpoint, 3);
+    }
+    else if ((stateOuterLoop == unlocked || stateOuterLoop == scanning) && start)
+    {
+      // float sideRange = (goLeft) ? (float)logGetUint(idRight)/1000.0f : (float)logGetUint(idLeft)/1000.0f;
+      // float frontRange = (float)logGetUint(idFront) / 1000.0f;
       float estYawDeg = logGetFloat(idStabilizerYaw);
       float estYawRad = estYawDeg * (float)M_PI / 180.0f;
 
-      //Adjust height based on up ranger input
+      // Adjust height based on obstacles above (hand or ceiling)
       uint16_t up_o = radius - MIN(up, radius);
       float cmdHeight = spHeight - up_o / 1000.0f;
 
-      cmdVelX = 0.0f;
-      cmdVelY = 0.0f;
-      cmdAngWRad = 0.0f;
-      cmdAngWDeg = 0.0f;
-
-      // Only go to the state machine if the crazyflie has reached a certain height
-      if (heightEstimate > spHeight - 0.1f)
+      // --- 3. STATE MACHINE: 5s SEARCH / 5s SCAN ---
+      if (stateOuterLoop == unlocked)
       {
-        // Set the wall following direction
-        int direction;
-        if (goLeft)
+        if (timeElapsed < 5.0f) // 5s Wall-Following
         {
-          direction = 1;
+          int direction = (goLeft) ? 1 : -1;
+          stateInnerLoop = wallFollower(&cmdVelX, &cmdVelY, &cmdAngWRad, frontRange, sideRange, estYawRad, direction, timeNow);
+          cmdAngWDeg = cmdAngWRad * 180.0f / (float)M_PI;
         }
-        else
+        else 
         {
-          direction = -1;
+          stateOuterLoop = scanning; // Switch to Scan phase
         }
-
-        // The wall-following state machine which outputs velocity commands
-        float timeNow = usecTimestamp() / 1e6;
-        stateInnerLoop = wallFollower(&cmdVelX, &cmdVelY, &cmdAngWRad, frontRange, sideRange, estYawRad, direction, timeNow);
-        cmdAngWDeg = cmdAngWRad * 180.0f / (float)M_PI;
       }
-      // Turn velocity commands into setpoints and send it to the commander
-      setVelocitySetpoint(&setpoint, cmdVelX, cmdVelY, cmdHeight, cmdAngWDeg);
+      else if (stateOuterLoop == scanning)
+      {
+        if (timeElapsed < 10.0f) // 5s Scan (Total 10s cycle)
+        {
+          cmdAngWDeg = 72.0f; // 360 degrees in 5s
+          cmdVelX = 0.0f;
+          cmdVelY = 0.0f;
+        }
+        else 
+        {
+          stateOuterLoop = unlocked;
+          stateStartTime = timeNow; // Reset Cycle back to Wall-Following
+        }
+      }
+
+      // Execute movement if at safe height
+      if (heightEstimate > spHeight - 0.1f) {
+        setVelocitySetpoint(&setpoint, cmdVelX, cmdVelY, cmdHeight, cmdAngWDeg);
+      } else {
+        setVelocitySetpoint(&setpoint, 0.0f, 0.0f, cmdHeight, 0.0f);
+      }
       commanderSetSetpoint(&setpoint, 3);
 
-      // Handling stopping with hand above the crazyflie
-      if (cmdHeight < spHeight - 0.2f)
-      {
+      // Manual stop override (Hand above drone)
+      if (cmdHeight < spHeight - 0.2f) {
         stateOuterLoop = stopping;
-        DEBUG_PRINT("X\n");
+        start = false;
       }
     }
-    else
+    else // --- 4. IDLE or STOPPED ---
     {
-
-      // Handeling locking and unlocking
-      if (stateOuterLoop == stopping && up > stoppedTh)
-      {
-        DEBUG_PRINT("%i", up);
-        stateOuterLoop = idle;
-        DEBUG_PRINT("S\n");
+      // Handle Python 'Stop' command
+      if (stateOuterLoop == unlocked || stateOuterLoop == scanning) {
+          stateOuterLoop = stopping;
       }
 
-      // If the up multiranger is activated for the first time, prepare to be unlocked
-      if (up < unlockThLow && stateOuterLoop == idle && up > 0.001f)
-      {
-        DEBUG_PRINT("Waiting for hand to be removed!\n");
-        stateOuterLoop = lowUnlock;
+      // Hand-unlock logic (Backup)
+      if (stateOuterLoop == stopping && up > stoppedTh) { stateOuterLoop = idle; }
+      // Unlocks automatically when Python sends 'start'
+      if (stateOuterLoop == idle && start && positioningInit && multirangerInit) {
+        stateOuterLoop = searching;
+        stateStartTime = usecTimestamp() / 1e6;
+        DEBUG_PRINT("Start command received: Searching for wall...\n");
       }
 
-      // Unlock CF if hand above is removed, and if the positioningdeckand multiranger deck is initalized.
-      if (up > unlockThHigh && stateOuterLoop == lowUnlock && positioningInit && multirangerInit)
-      {
-        DEBUG_PRINT("Unlocked!\n");
-        stateOuterLoop = unlocked;
-      }
-
-      // Stop the crazyflie with idle or stopping state
-      if (stateOuterLoop == idle || stateOuterLoop == stopping)
-      {
+      // Ensure motors are off when idle
+      if (stateOuterLoop == idle || stateOuterLoop == stopping) {
         memset(&setpoint, 0, sizeof(setpoint_t));
         commanderSetSetpoint(&setpoint, 3);
       }
@@ -242,16 +222,16 @@ void appMain()
   }
 }
 
+// Parameters exposed to Python Script
 PARAM_GROUP_START(app)
+PARAM_ADD(PARAM_UINT8, start, &start)
 PARAM_ADD(PARAM_UINT8, goLeft, &goLeft)
 PARAM_ADD(PARAM_FLOAT, distanceWall, &distanceToWall)
 PARAM_ADD(PARAM_FLOAT, maxSpeed, &maxForwardSpeed)
 PARAM_GROUP_STOP(app)
 
+// Logging for debugging
 LOG_GROUP_START(app)
-LOG_ADD(LOG_FLOAT, cmdVelX, &cmdVelX)
-LOG_ADD(LOG_FLOAT, cmdVelY, &cmdVelY)
-LOG_ADD(LOG_FLOAT, cmdAngWRad, &cmdAngWRad)
-LOG_ADD(LOG_UINT8, stateInnerLoop, &stateInnerLoop)
-LOG_ADD(LOG_UINT8, stateOuterLoop, &stateOuterLoop)
+LOG_ADD(LOG_FLOAT, vbat, &cmdVelX) 
+LOG_ADD(LOG_UINT8, stateOuter, &stateOuterLoop)
 LOG_GROUP_STOP(app)
