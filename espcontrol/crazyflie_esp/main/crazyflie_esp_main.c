@@ -1,367 +1,278 @@
 /*
- * Crazyflie telemetry I2C slave bridge for ESP32-C3.
+ * ESP32-C3 application architecture:
+ *   1) AMG8833 thermal sensor over I2C (ESP32 master, AMG8833 slave at 0x69/0x68)
+ *   2) Crazyflie STM32 communication over UART (bidirectional packet link)
  *
- * Wiring (ESP32-C3 ↔ Crazyflie 2.x):
- *   - SDA  (GPIO8)  ←→ SDA
- *   - SCL  (GPIO9)  ←→ SCL
- *   - GND  ↔ GND (shared)
- *   Bus speed: 100 kHz. Crazyflie acts as I²C master, ESP32-C3 as slave at address 0x28.
- *
- * Packet format (24 bytes, little-endian):
- *   0  : uint8  proto_ver
- *   1  : uint8  flags (bit0=valid_est, bit1=valid_ranger)
- *   2  : uint32 time_us
- *   6  : int16  yaw_mrad
- *   8  : int16  vx_mmps
- *   10 : int16  vy_mmps
- *   12 : uint16 rng_mm[5] (front, back, left, right, up)
- *   22 : uint16 crc16_ccitt (bytes 0..21)
- *
- * TODO: Crazyflie firmware must perform I²C master writes of exactly 24 bytes at 50–100 Hz.
- *
- * This module configures I2C_NUM_0 as an I²C slave on the ESP32-C3, parses incoming frames,
- * validates CRC16-CCITT, and exposes the latest decoded telemetry sample to other tasks.
+ * Legacy note:
+ *   Previous ESP32<->Crazyflie I2C bridge is disabled and preserved in
+ *   legacy_cf_i2c_bridge_disabled.c.
  */
 
-#include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
-#include "driver/i2c.h"
-#include "esp_timer.h"
 #include "esp_log.h"
-#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
-#include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#define CF_I2C_PORT              I2C_NUM_0
-#define CF_I2C_SDA_GPIO          GPIO_NUM_8
-#define CF_I2C_SCL_GPIO          GPIO_NUM_9
-#define CF_I2C_SLAVE_ADDRESS     0x28
-#define CF_I2C_SLAVE_RX_BUF_LEN  512     // Provide ample room for bursts and in-flight transfers.
+#include "amg8833.h"
+#include "uart_cf_comm.h"
 
-#define CF_FRAME_SIZE_BYTES      24
-#define CF_PAYLOAD_LEN_BYTES     22      // Bytes covered by CRC16.
-#define CF_EXPECTED_PROTO_VER    1
-#define CF_FLAGS_VALID_MASK      0x03
-#define CF_SAMPLE_EVENT_READY_BIT BIT0
+#define AMG_I2C_PORT                 I2C_NUM_0
+#define AMG_I2C_SDA_PIN              GPIO_NUM_8
+#define AMG_I2C_SCL_PIN              GPIO_NUM_9
+#define AMG_I2C_CLOCK_HZ             400000U
+#define AMG_I2C_PREFERRED_ADDRESS    AMG8833_I2C_ADDRESS_DEFAULT
 
-#define CF_RX_TASK_STACK_BYTES   4096
-#define CF_RX_TASK_PRIORITY      5
+#define CF_UART_PORT                 UART_NUM_1
+#define CF_UART_TX_PIN               GPIO_NUM_20
+#define CF_UART_RX_PIN               GPIO_NUM_21
+#define CF_UART_BAUDRATE             115200
 
-static const char *TAG = "cf_i2c_slave";
+#define MAIN_LOOP_PERIOD_MS          100U
+#define UART_TEST_PERIOD_MS          1000U
+#define UART_TEST_TX_ENABLE          1U
+#define UART_AUTO_FLIGHT_TEST_ENABLE 1U
+#define UART_AUTO_TAKEOFF_DELAY_MS   3000U
+#define UART_AUTO_HOVER_TIME_MS      5000U
+#define UART_AUTO_TAKEOFF_HEIGHT_CM  30U
+#define UART_AUTO_TAKEOFF_DUR_MS     2000U
+#define UART_AUTO_LAND_HEIGHT_CM     30U
+#define UART_AUTO_LAND_DUR_MS        2000U
+
+static const char *UART_TEST_FROM_ESP32_PREFIX = "UART_TEST_FROM_ESP32";
 
 typedef struct {
-    uint8_t  proto_ver;
-    uint8_t  flags;
-    uint32_t time_us;
-    int16_t  yaw_mrad;
-    int16_t  vx_mmps;
-    int16_t  vy_mmps;
-    uint16_t rng_mm[5];  // F, B, L, R, U
-} cf_telemetry_t;
+    bool human_detected;
+    uint8_t confidence;
+    float max_temp_c;
+    float avg_temp_c;
+} inference_result_t;
 
-static SemaphoreHandle_t s_sample_mutex = NULL;
-static EventGroupHandle_t s_sample_events = NULL;
-static volatile bool s_sample_valid = false;
-static cf_telemetry_t s_latest_sample = {0};
-static bool s_logged_first_byte = false;
-static int64_t s_last_sample_log_us = 0;
-static int64_t s_last_crc_log_us = 0;
+static const char *TAG = "cf_esp_app";
 
-static uint16_t cf_crc16_ccitt(const uint8_t *data, size_t len);
-static uint16_t read_le_u16(const uint8_t *p);
-static int16_t read_le_i16(const uint8_t *p);
-static uint32_t read_le_u32(const uint8_t *p);
-static void cf_handle_frame(const uint8_t *frame);
-static void cf_i2c_rx_task(void *arg);
-
-bool cf_telemetry_get_latest(cf_telemetry_t *out, TickType_t timeout_ticks);
-
-/***********************************************************************************************************************
- * CRC16-CCITT (poly 0x1021, init 0xFFFF, reflect off, xorout 0x0000)
- ***********************************************************************************************************************/
-static uint16_t cf_crc16_ccitt(const uint8_t *data, size_t len)
+static void send_flight_command(uint8_t command_id, uint16_t height_cm, uint16_t duration_ms)
 {
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= ((uint16_t)data[i]) << 8;
-        for (int bit = 0; bit < 8; ++bit) {
-            if (crc & 0x8000) {
-                crc = (uint16_t)((crc << 1) ^ 0x1021);
-            } else {
-                crc <<= 1;
-            }
+    uint8_t payload[5] = {0};
+    payload[0] = command_id;
+    payload[1] = (uint8_t)(height_cm & 0xFFU);
+    payload[2] = (uint8_t)((height_cm >> 8U) & 0xFFU);
+    payload[3] = (uint8_t)(duration_ms & 0xFFU);
+    payload[4] = (uint8_t)((duration_ms >> 8U) & 0xFFU);
+
+    const esp_err_t err = uart_cf_send_packet(UART_CF_TYPE_COMMAND, payload, sizeof(payload));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "UART FLIGHT CMD TX -> Crazyflie: cmd=0x%02X height=%ucm duration=%ums",
+                 command_id,
+                 (unsigned)height_cm,
+                 (unsigned)duration_ms);
+    } else {
+        ESP_LOGW(TAG, "UART FLIGHT CMD TX failed (cmd=0x%02X): %s", command_id, esp_err_to_name(err));
+    }
+}
+
+static inference_result_t run_human_inference(const float *pixels, size_t count, float threshold_c)
+{
+    inference_result_t result = {0};
+    if ((pixels == NULL) || (count == 0U)) {
+        return result;
+    }
+
+    float max_temp = pixels[0];
+    float sum_temp = 0.0f;
+    for (size_t i = 0; i < count; i++) {
+        if (pixels[i] > max_temp) {
+            max_temp = pixels[i];
         }
+        sum_temp += pixels[i];
     }
-    return crc;
+
+    const float avg_temp = sum_temp / (float)count;
+    const float hotspot_delta = max_temp - avg_temp;
+
+    // Lightweight onboard inference placeholder:
+    // detect a person-like hotspot when absolute heat and local contrast are both high.
+    result.human_detected = (max_temp >= threshold_c) && (hotspot_delta >= 2.0f);
+    result.max_temp_c = max_temp;
+    result.avg_temp_c = avg_temp;
+
+    float score = ((max_temp - threshold_c) * 8.0f) + (hotspot_delta * 12.0f);
+    if (score < 0.0f) {
+        score = 0.0f;
+    }
+    if (score > 100.0f) {
+        score = 100.0f;
+    }
+    result.confidence = (uint8_t)lrintf(score);
+
+    return result;
 }
 
-/***********************************************************************************************************************
- * Little-endian helpers
- ***********************************************************************************************************************/
-static uint16_t read_le_u16(const uint8_t *p)
+static void send_detection_to_crazyflie(const inference_result_t *result, float thermistor_c)
 {
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-static int16_t read_le_i16(const uint8_t *p)
-{
-    return (int16_t)read_le_u16(p);
-}
-
-static uint32_t read_le_u32(const uint8_t *p)
-{
-    return ((uint32_t)p[0]) |
-           ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
-}
-
-/***********************************************************************************************************************
- * Frame processing (called from RX task when 24-byte frame assembled)
- ***********************************************************************************************************************/
-static void cf_handle_frame(const uint8_t *frame)
-{
-    const uint16_t crc_expected = read_le_u16(&frame[CF_PAYLOAD_LEN_BYTES]);
-    const uint16_t crc_actual = cf_crc16_ccitt(frame, CF_PAYLOAD_LEN_BYTES);
-
-    if (crc_expected != crc_actual) {
-    const int64_t now_us = esp_timer_get_time();
-    if ((s_last_crc_log_us == 0) || ((now_us - s_last_crc_log_us) > 500000)) {
-        ESP_LOGW(TAG, "CRC mismatch (calc=0x%04X, frame=0x%04X) – dropping frame", crc_actual, crc_expected);
-        s_last_crc_log_us = now_us;
-    } else {
-        ESP_LOGD(TAG, "CRC mismatch (calc=0x%04X, frame=0x%04X)", crc_actual, crc_expected);
-    }
-    return;
-  }
-
-    cf_telemetry_t sample = {
-        .proto_ver = frame[0],
-        .flags = frame[1],
-        .time_us = read_le_u32(&frame[2]),
-        .yaw_mrad = read_le_i16(&frame[6]),
-        .vx_mmps = read_le_i16(&frame[8]),
-        .vy_mmps = read_le_i16(&frame[10]),
-    };
-
-    for (size_t i = 0; i < 5; ++i) {
-        sample.rng_mm[i] = read_le_u16(&frame[12 + (i * 2)]);
-    }
-
-    if (sample.proto_ver != CF_EXPECTED_PROTO_VER) {
-        ESP_LOGW(TAG, "Unexpected proto_ver=%u (expected %u) – accepting frame anyway",
-                 sample.proto_ver, CF_EXPECTED_PROTO_VER);
-    }
-
-    if ((sample.flags & ~CF_FLAGS_VALID_MASK) != 0) {
-        ESP_LOGW(TAG, "Reserved flag bits set (flags=0x%02X) – accepting frame anyway", sample.flags);
-    }
-
-    if (xSemaphoreTake(s_sample_mutex, portMAX_DELAY) == pdTRUE) {
-        s_latest_sample = sample;
-        s_sample_valid = true;
-        xSemaphoreGive(s_sample_mutex);
-        (void)xEventGroupSetBits(s_sample_events, CF_SAMPLE_EVENT_READY_BIT);
-    } else {
-        ESP_LOGE(TAG, "Failed to take sample mutex – dropping frame");
+    if (result == NULL) {
         return;
     }
 
-    const int64_t now_us = esp_timer_get_time();
-    if ((now_us - s_last_sample_log_us) >= 200000) {  // ~5 Hz
-        ESP_LOGI(TAG,
-                 "CF: t=%" PRIu32 " us | yaw=%+d mrad | vx=%+d vy=%+d mm/s | "
-                 "rng=[F:%u,B:%u,L:%u,R:%u,U:%u] flags=0x%02X",
-                 sample.time_us,
-                 sample.yaw_mrad,
-                 sample.vx_mmps,
-                 sample.vy_mmps,
-                 sample.rng_mm[0],
-                 sample.rng_mm[1],
-                 sample.rng_mm[2],
-                 sample.rng_mm[3],
-                 sample.rng_mm[4],
-                 sample.flags);
-        s_last_sample_log_us = now_us;
-    } else {
-        ESP_LOGD(TAG,
-                 "CF: t=%" PRIu32 " us | yaw=%+d mrad | vx=%+d vy=%+d mm/s | "
-                 "rng=[F:%u,B:%u,L:%u,R:%u,U:%u] flags=0x%02X",
-                 sample.time_us,
-                 sample.yaw_mrad,
-                 sample.vx_mmps,
-                 sample.vy_mmps,
-                 sample.rng_mm[0],
-                 sample.rng_mm[1],
-                 sample.rng_mm[2],
-                 sample.rng_mm[3],
-                 sample.rng_mm[4],
-                 sample.flags);
+    const uint32_t timestamp_ms = (uint32_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+    const int16_t max_temp_x100 = (int16_t)lrintf(result->max_temp_c * 100.0f);
+    const int16_t thermistor_x100 = (int16_t)lrintf(thermistor_c * 100.0f);
+
+    uint8_t payload[10] = {0};
+    payload[0] = result->human_detected ? 1U : 0U;
+    payload[1] = result->confidence;
+    payload[2] = (uint8_t)(max_temp_x100 & 0xFF);
+    payload[3] = (uint8_t)((max_temp_x100 >> 8) & 0xFF);
+    payload[4] = (uint8_t)(thermistor_x100 & 0xFF);
+    payload[5] = (uint8_t)((thermistor_x100 >> 8) & 0xFF);
+    payload[6] = (uint8_t)(timestamp_ms & 0xFF);
+    payload[7] = (uint8_t)((timestamp_ms >> 8) & 0xFF);
+    payload[8] = (uint8_t)((timestamp_ms >> 16) & 0xFF);
+    payload[9] = (uint8_t)((timestamp_ms >> 24) & 0xFF);
+
+    const esp_err_t err = uart_cf_send_packet(UART_CF_TYPE_HUMAN_DETECT, payload, sizeof(payload));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "uart_cf_send_packet failed: %s", esp_err_to_name(err));
     }
 }
 
-/***********************************************************************************************************************
- * I²C Rx Task – reassembles fixed-size frames from the slave RX FIFO.
- ***********************************************************************************************************************/
-static void cf_i2c_rx_task(void *arg)
+void app_main(void)
 {
-    uint8_t assembly_buf[CF_FRAME_SIZE_BYTES] = {0};
-    size_t assembly_len = 0;
-    uint8_t chunk_buf[CF_FRAME_SIZE_BYTES] = {0};
+    ESP_LOGI(TAG, "ESP32 dual-protocol firmware starting");
+    ESP_LOGI(TAG, "Legacy ESP32<->Crazyflie I2C bridge disabled (see legacy_cf_i2c_bridge_disabled.c)");
 
-    ESP_LOGI(TAG, "I²C RX task started");
+    ESP_ERROR_CHECK(uart_cf_init(
+        CF_UART_PORT,
+        CF_UART_TX_PIN,
+        CF_UART_RX_PIN,
+        CF_UART_BAUDRATE));
+
+    ESP_LOGI(TAG,
+             "Crazyflie UART config: port=%d TX=%d RX=%d baud=%d 8N1",
+             CF_UART_PORT,
+             CF_UART_TX_PIN,
+             CF_UART_RX_PIN,
+             CF_UART_BAUDRATE);
+
+    bool amg_available = false;
+    const esp_err_t amg_init_err = amg8833_init(
+        AMG_I2C_PORT,
+        AMG_I2C_SDA_PIN,
+        AMG_I2C_SCL_PIN,
+        AMG_I2C_CLOCK_HZ,
+        AMG_I2C_PREFERRED_ADDRESS);
+    if (amg_init_err == ESP_OK) {
+        amg_available = true;
+        ESP_LOGI(TAG,
+                 "AMG8833 I2C master config: SDA=%d SCL=%d clk=%luHz addr=0x%02X",
+                 AMG_I2C_SDA_PIN,
+                 AMG_I2C_SCL_PIN,
+                 (unsigned long)AMG_I2C_CLOCK_HZ,
+                 amg8833_get_i2c_address());
+    } else {
+        ESP_LOGW(TAG,
+                 "AMG8833 init skipped for UART-only bring-up (%s). I2C sensor path disabled until sensor is connected.",
+                 esp_err_to_name(amg_init_err));
+    }
+
+    float pixels[AMG8833_PIXEL_COUNT] = {0};
+    int64_t last_log_ms = 0;
+    int64_t last_uart_test_tx_ms = 0;
+    uint32_t uart_test_seq = 0;
+    bool demo_takeoff_sent = false;
+    bool demo_land_sent = false;
+    int64_t demo_start_ms = -1;
+    int64_t demo_takeoff_sent_ms = -1;
 
     while (true) {
-        const int bytes_read = i2c_slave_read_buffer(
-            CF_I2C_PORT, chunk_buf, sizeof(chunk_buf), pdMS_TO_TICKS(50));
-
-        if (bytes_read < 0) {
-            ESP_LOGW(TAG, "i2c_slave_read_buffer error (%d)", bytes_read);
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        if (bytes_read == 0) {
-            // No data this interval – keep waiting.
-            continue;
-        }
-
-        if (!s_logged_first_byte) {
-            ESP_LOGI(TAG, "First I2C bytes received (%d)", bytes_read);
-            s_logged_first_byte = true;
-        }
-        ESP_LOGD(TAG, "I2C RX got %d byte(s)", bytes_read);
-
-        size_t processed = 0;
-        while (processed < (size_t)bytes_read) {
-            const size_t remaining_frame = CF_FRAME_SIZE_BYTES - assembly_len;
-            const size_t remaining_chunk = (size_t)bytes_read - processed;
-            const size_t to_copy = remaining_chunk < remaining_frame ? remaining_chunk : remaining_frame;
-
-            memcpy(&assembly_buf[assembly_len], &chunk_buf[processed], to_copy);
-            assembly_len += to_copy;
-            processed += to_copy;
-
-            if (assembly_len == CF_FRAME_SIZE_BYTES) {
-                cf_handle_frame(assembly_buf);
-                assembly_len = 0;
+        // Process any incoming Crazyflie UART commands first (non-blocking).
+        uart_cf_packet_t rx_packet = {0};
+        while (uart_cf_receive_packet(&rx_packet, 0)) {
+            if (rx_packet.type == UART_CF_TYPE_TEST_TEXT) {
+                char test_rx[UART_CF_MAX_DATA_LEN + 1] = {0};
+                const size_t copy_len = (rx_packet.length < UART_CF_MAX_DATA_LEN)
+                                            ? rx_packet.length
+                                            : UART_CF_MAX_DATA_LEN;
+                if (copy_len > 0U) {
+                    memcpy(test_rx, rx_packet.data, copy_len);
+                }
+                test_rx[copy_len] = '\0';
+                ESP_LOGI(TAG, "UART TEST RX <- Crazyflie: %s", test_rx);
+            } else {
+                uart_cf_parse_message(&rx_packet);
             }
         }
 
-        if (assembly_len > CF_FRAME_SIZE_BYTES) {
-            // Should never happen, but guard against buffer overruns.
-            ESP_LOGW(TAG, "Assembly overflow (%u) – resynchronizing", (unsigned)assembly_len);
-            assembly_len = 0;
+        const int64_t now_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if ((UART_AUTO_FLIGHT_TEST_ENABLE != 0U) && !demo_land_sent) {
+            if (demo_start_ms < 0) {
+                demo_start_ms = now_ms;
+            }
+
+            if (!demo_takeoff_sent && ((now_ms - demo_start_ms) >= UART_AUTO_TAKEOFF_DELAY_MS)) {
+                send_flight_command(UART_CF_CMD_TAKEOFF, UART_AUTO_TAKEOFF_HEIGHT_CM, UART_AUTO_TAKEOFF_DUR_MS);
+                demo_takeoff_sent = true;
+                demo_takeoff_sent_ms = now_ms;
+            } else if (demo_takeoff_sent &&
+                       !demo_land_sent &&
+                       ((now_ms - demo_takeoff_sent_ms) >= UART_AUTO_HOVER_TIME_MS)) {
+                send_flight_command(UART_CF_CMD_LAND, UART_AUTO_LAND_HEIGHT_CM, UART_AUTO_LAND_DUR_MS);
+                demo_land_sent = true;
+            }
         }
-    }
-}
 
-/***********************************************************************************************************************
- * Public API – retrieve latest telemetry sample.
- ***********************************************************************************************************************/
-bool cf_telemetry_get_latest(cf_telemetry_t *out, TickType_t timeout_ticks)
-{
-    if (!out) {
-        return false;
-    }
-
-    if (!s_sample_valid) {
-        const EventBits_t bits = xEventGroupWaitBits(
-            s_sample_events, CF_SAMPLE_EVENT_READY_BIT, pdFALSE, pdFALSE, timeout_ticks);
-        if ((bits & CF_SAMPLE_EVENT_READY_BIT) == 0) {
-            return false;  // Timed out waiting for the first valid sample.
+        if ((UART_TEST_TX_ENABLE != 0U) && ((now_ms - last_uart_test_tx_ms) >= UART_TEST_PERIOD_MS)) {
+            char test_msg[UART_CF_MAX_DATA_LEN + 1] = {0};
+            const int test_len_i = snprintf(test_msg,
+                                            sizeof(test_msg),
+                                            "%s:%lu",
+                                            UART_TEST_FROM_ESP32_PREFIX,
+                                            (unsigned long)uart_test_seq++);
+            const size_t test_len = (test_len_i > 0) ? (size_t)test_len_i : 0U;
+            const esp_err_t test_err = uart_cf_send_packet(
+                UART_CF_TYPE_TEST_TEXT,
+                (const uint8_t *)test_msg,
+                (uint8_t)test_len);
+            if (test_err == ESP_OK) {
+                ESP_LOGI(TAG, "UART TEST TX -> Crazyflie: %s", test_msg);
+            } else {
+                ESP_LOGW(TAG, "UART TEST TX failed: %s", esp_err_to_name(test_err));
+            }
+            last_uart_test_tx_ms = now_ms;
         }
-    }
 
-    if (xSemaphoreTake(s_sample_mutex, timeout_ticks) != pdTRUE) {
-        return false;
-    }
+        if (amg_available) {
+            float thermistor_c = 0.0f;
+            esp_err_t read_err = amg8833_read_pixels(pixels, AMG8833_PIXEL_COUNT);
+            if (read_err == ESP_OK) {
+                read_err = amg8833_read_thermistor(&thermistor_c);
+            }
 
-    const bool valid = s_sample_valid;
-    if (valid) {
-        *out = s_latest_sample;
-    }
-    xSemaphoreGive(s_sample_mutex);
-    return valid;
-}
+            if (read_err == ESP_OK) {
+                const float threshold_c = uart_cf_get_detection_threshold_c();
+                const inference_result_t result = run_human_inference(pixels, AMG8833_PIXEL_COUNT, threshold_c);
+                send_detection_to_crazyflie(&result, thermistor_c);
 
-/***********************************************************************************************************************
- * I²C slave initialization
- ***********************************************************************************************************************/
-static esp_err_t cf_i2c_slave_init(void)
-{
-    i2c_config_t cfg = {
-        .mode = I2C_MODE_SLAVE,
-        .sda_io_num = CF_I2C_SDA_GPIO,
-        .scl_io_num = CF_I2C_SCL_GPIO,
-        .sda_pullup_en = GPIO_PULLUP_DISABLE,
-        .scl_pullup_en = GPIO_PULLUP_DISABLE,
-        .slave = {
-            .addr_10bit_en = 0,
-            .slave_addr = CF_I2C_SLAVE_ADDRESS,
-        },
-        .clk_flags = 0,  // Not used in slave mode; master drives the clock (100 kHz on Crazyflie side).
-    };
-
-    ESP_ERROR_CHECK(i2c_param_config(CF_I2C_PORT, &cfg));
-    ESP_ERROR_CHECK(i2c_driver_install(
-        CF_I2C_PORT,
-        I2C_MODE_SLAVE,
-        CF_I2C_SLAVE_RX_BUF_LEN,
-        0,   // No TX buffer needed for slave.
-        0));
-    ESP_ERROR_CHECK(i2c_reset_rx_fifo(CF_I2C_PORT));
-
-    ESP_LOGI(TAG, "Configured I²C slave: port=%d addr=0x%02X SDA=GPIO%d SCL=GPIO%d (Crazyflie master @100 kHz)",
-             CF_I2C_PORT,
-             CF_I2C_SLAVE_ADDRESS,
-             CF_I2C_SDA_GPIO,
-             CF_I2C_SCL_GPIO);
-
-    return ESP_OK;
-}
-
-/***********************************************************************************************************************
- * app_main – entry point
- ***********************************************************************************************************************/
-void app_main(void)
-{
-    ESP_LOGI(TAG, "==== Crazyflie ↔ ESP32-C3 I²C telemetry bridge starting ====");
-    ESP_LOGI(TAG, "Pinout: SDA=GPIO%d, SCL=GPIO%d | Slave address 0x%02X | Target: ESP32-C3",
-             CF_I2C_SDA_GPIO,
-             CF_I2C_SCL_GPIO,
-             CF_I2C_SLAVE_ADDRESS);
-
-    s_sample_mutex = xSemaphoreCreateMutex();
-    configASSERT(s_sample_mutex != NULL);
-
-    s_sample_events = xEventGroupCreate();
-    configASSERT(s_sample_events != NULL);
-
-    ESP_ERROR_CHECK(cf_i2c_slave_init());
-
-    BaseType_t task_ok = xTaskCreatePinnedToCore(
-        cf_i2c_rx_task,
-        "cf_i2c_rx",
-        CF_RX_TASK_STACK_BYTES,
-        NULL,
-        CF_RX_TASK_PRIORITY,
-        NULL,
-        tskNO_AFFINITY);
-    configASSERT(task_ok == pdPASS);
-
-    while (true) {
-        cf_telemetry_t sample;
-        const bool got_sample = cf_telemetry_get_latest(&sample, pdMS_TO_TICKS(1000));
-        if (!got_sample) {
-            ESP_LOGW(TAG, "Heartbeat: no telemetry frames received in the last second");
+                if ((now_ms - last_log_ms) >= 1000) {
+                    ESP_LOGI(TAG,
+                             "Thermal inference: detect=%u conf=%u%% max=%.2fC avg=%.2fC therm=%.2fC threshold=%.1fC",
+                             result.human_detected ? 1U : 0U,
+                             result.confidence,
+                             result.max_temp_c,
+                             result.avg_temp_c,
+                             thermistor_c,
+                             threshold_c);
+                    last_log_ms = now_ms;
+                }
+            } else {
+                ESP_LOGW(TAG, "AMG8833 read failed: %s", esp_err_to_name(read_err));
+            }
         }
-        // Sleep regardless – either we waited inside cf_telemetry_get_latest or we just sleep briefly.
-        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        vTaskDelay(pdMS_TO_TICKS(MAIN_LOOP_PERIOD_MS));
     }
 }

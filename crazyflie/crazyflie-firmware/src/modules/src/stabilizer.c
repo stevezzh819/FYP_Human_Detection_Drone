@@ -51,7 +51,9 @@
 #include "supervisor.h"
 
 #include "estimator.h"
-#include "esp_bridge.h"
+// Legacy ESP<->CF I2C bridge disabled for UART migration.
+// #include "esp_bridge.h"
+#include "esp_uart_bridge.h"
 #include "usddeck.h"
 #include "quatcompress.h"
 #include "statsCnt.h"
@@ -77,6 +79,8 @@ static setpoint_t tempSetpoint;
 
 static StateEstimatorType estimatorType;
 static ControllerType controllerType;
+static uint8_t espHumanDetected = 0;
+static uint8_t espHumanConfidence = 0;
 
 static STATS_CNT_RATE_DEFINE(stabilizerRate, 500);
 static rateSupervisor_t rateSupervisorContext;
@@ -121,7 +125,7 @@ static struct {
 
 STATIC_MEM_TASK_ALLOC(stabilizerTask, STABILIZER_TASK_STACKSIZE);
 STATIC_MEM_TASK_ALLOC(rateSupervisorTask, RATE_SUPERVISOR_TASK_STACKSIZE);
-STATIC_MEM_TASK_ALLOC(espBridgeTask, ESP_BRIDGE_TASK_STACKWORDS);
+STATIC_MEM_TASK_ALLOC(espUartBridgeTask, ESP_UART_BRIDGE_TASK_STACKWORDS);
 
 static void stabilizerTask(void* param);
 static void rateSupervisorTask(void* param);
@@ -190,10 +194,18 @@ void stabilizerInit(StateEstimatorType estimator)
 
   STATIC_MEM_TASK_CREATE(stabilizerTask, stabilizerTask, STABILIZER_TASK_NAME, NULL, STABILIZER_TASK_PRI);
 
-  if (espBridgeInit()) {
-    STATIC_MEM_TASK_CREATE(espBridgeTask, espBridgeTask, "espBridge", NULL, ESP_BRIDGE_TASK_PRI);
+  /*
+   * Legacy I2C communication disabled:
+   * if (espBridgeInit()) {
+   *   STATIC_MEM_TASK_CREATE(espBridgeTask, espBridgeTask, "espBridge", NULL, ESP_BRIDGE_TASK_PRI);
+   * } else {
+   *   DEBUG_PRINT("ESP bridge init failed\n");
+   * }
+   */
+  if (espUartBridgeInit()) {
+    STATIC_MEM_TASK_CREATE(espUartBridgeTask, espUartBridgeTask, "espUartBridge", NULL, ESP_UART_BRIDGE_TASK_PRI);
   } else {
-    DEBUG_PRINT("ESP bridge init failed\n");
+    DEBUG_PRINT("ESP UART bridge init failed\n");
   }
 
   isInit = true;
@@ -332,7 +344,13 @@ static void stabilizerTask(void* param)
       updateStateEstimatorAndControllerTypes();
 
       stateEstimator(&state, stabilizerStep);
-      espBridgeFeedState(&state);
+
+      bool detected = false;
+      uint8_t confidence = 0;
+      if (espUartBridgeGetLatestHumanDetection(&detected, &confidence, NULL)) {
+        espHumanDetected = detected ? 1U : 0U;
+        espHumanConfidence = confidence;
+      }
 
       const bool areMotorsAllowedToRun = supervisorAreMotorsAllowedToRun();
 
@@ -557,6 +575,14 @@ LOG_ADD(LOG_FLOAT, yaw, &state.attitude.yaw)
  * @brief Current thrust
  */
 LOG_ADD(LOG_FLOAT, thrust, &control.thrust)
+/**
+ * @brief Latest human-detection flag received from ESP32 over UART
+ */
+LOG_ADD(LOG_UINT8, espHuman, &espHumanDetected)
+/**
+ * @brief Latest human-detection confidence [0..100] received from ESP32 over UART
+ */
+LOG_ADD(LOG_UINT8, espConf, &espHumanConfidence)
 /**
  * @brief Rate of stabilizer loop
  */
