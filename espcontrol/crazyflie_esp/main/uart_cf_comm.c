@@ -23,6 +23,8 @@ static const char *TAG = "uart_cf_comm";
 static uart_port_t s_uart_port = UART_NUM_1;
 static bool s_is_init = false;
 static float s_detection_threshold_c = 30.0f;
+static uint32_t s_rx_byte_count = 0;
+static uint32_t s_rx_packet_count = 0;
 
 static uart_cf_rx_state_t s_rx_state = rxWaitHeader0;
 static uint8_t s_rx_type = 0;
@@ -165,6 +167,8 @@ esp_err_t uart_cf_init(uart_port_t uart_port,
 
     uart_cf_parser_reset();
     s_is_init = true;
+    s_rx_byte_count = 0;
+    s_rx_packet_count = 0;
 
     ESP_LOGI(TAG, "UART ready: port=%d tx=%d rx=%d baud=%d 8N1", s_uart_port, tx_pin, rx_pin, baudrate);
     return ESP_OK;
@@ -215,7 +219,9 @@ bool uart_cf_receive_packet(uart_cf_packet_t *packet, TickType_t timeout_ticks)
     uint8_t byte = 0;
     int bytes = uart_read_bytes(s_uart_port, &byte, 1, timeout_ticks);
     while (bytes > 0) {
+        s_rx_byte_count++;
         if (uart_cf_consume_byte(byte, packet)) {
+            s_rx_packet_count++;
             return true;
         }
         bytes = uart_read_bytes(s_uart_port, &byte, 1, 0);
@@ -256,4 +262,14 @@ void uart_cf_parse_message(const uart_cf_packet_t *packet)
 float uart_cf_get_detection_threshold_c(void)
 {
     return s_detection_threshold_c;
+}
+
+uint32_t uart_cf_get_rx_byte_count(void)
+{
+    return s_rx_byte_count;
+}
+
+uint32_t uart_cf_get_rx_packet_count(void)
+{
+    return s_rx_packet_count;
 }

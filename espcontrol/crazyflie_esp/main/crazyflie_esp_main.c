@@ -34,14 +34,11 @@
 
 #define MAIN_LOOP_PERIOD_MS          100U
 #define UART_TEST_PERIOD_MS          1000U
-#define UART_TEST_TX_ENABLE          1U
+#define UART_TEST_TX_ENABLE          0U
 #define UART_AUTO_FLIGHT_TEST_ENABLE 1U
 #define UART_AUTO_TAKEOFF_DELAY_MS   3000U
-#define UART_AUTO_HOVER_TIME_MS      5000U
 #define UART_AUTO_TAKEOFF_HEIGHT_CM  30U
 #define UART_AUTO_TAKEOFF_DUR_MS     2000U
-#define UART_AUTO_LAND_HEIGHT_CM     30U
-#define UART_AUTO_LAND_DUR_MS        2000U
 
 static const char *UART_TEST_FROM_ESP32_PREFIX = "UART_TEST_FROM_ESP32";
 
@@ -182,11 +179,10 @@ void app_main(void)
     float pixels[AMG8833_PIXEL_COUNT] = {0};
     int64_t last_log_ms = 0;
     int64_t last_uart_test_tx_ms = 0;
+    int64_t last_uart_rx_stats_ms = 0;
     uint32_t uart_test_seq = 0;
     bool demo_takeoff_sent = false;
-    bool demo_land_sent = false;
     int64_t demo_start_ms = -1;
-    int64_t demo_takeoff_sent_ms = -1;
 
     while (true) {
         // Process any incoming Crazyflie UART commands first (non-blocking).
@@ -208,20 +204,23 @@ void app_main(void)
         }
 
         const int64_t now_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if ((UART_AUTO_FLIGHT_TEST_ENABLE != 0U) && !demo_land_sent) {
+        if ((now_ms - last_uart_rx_stats_ms) >= 1000) {
+            ESP_LOGI(TAG,
+                     "UART RX stats: bytes=%lu packets=%lu",
+                     (unsigned long)uart_cf_get_rx_byte_count(),
+                     (unsigned long)uart_cf_get_rx_packet_count());
+            last_uart_rx_stats_ms = now_ms;
+        }
+
+        if ((UART_AUTO_FLIGHT_TEST_ENABLE != 0U) && !demo_takeoff_sent) {
             if (demo_start_ms < 0) {
                 demo_start_ms = now_ms;
             }
 
-            if (!demo_takeoff_sent && ((now_ms - demo_start_ms) >= UART_AUTO_TAKEOFF_DELAY_MS)) {
+            // Battery endurance mode: send a single takeoff command only.
+            if ((now_ms - demo_start_ms) >= UART_AUTO_TAKEOFF_DELAY_MS) {
                 send_flight_command(UART_CF_CMD_TAKEOFF, UART_AUTO_TAKEOFF_HEIGHT_CM, UART_AUTO_TAKEOFF_DUR_MS);
                 demo_takeoff_sent = true;
-                demo_takeoff_sent_ms = now_ms;
-            } else if (demo_takeoff_sent &&
-                       !demo_land_sent &&
-                       ((now_ms - demo_takeoff_sent_ms) >= UART_AUTO_HOVER_TIME_MS)) {
-                send_flight_command(UART_CF_CMD_LAND, UART_AUTO_LAND_HEIGHT_CM, UART_AUTO_LAND_DUR_MS);
-                demo_land_sent = true;
             }
         }
 

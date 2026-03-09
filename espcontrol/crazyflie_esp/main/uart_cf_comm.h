@@ -40,3 +40,5 @@ bool uart_cf_receive_packet(uart_cf_packet_t *packet, TickType_t timeout_ticks);
 void uart_cf_parse_message(const uart_cf_packet_t *packet);
 
 float uart_cf_get_detection_threshold_c(void);
+uint32_t uart_cf_get_rx_byte_count(void);
+uint32_t uart_cf_get_rx_packet_count(void);
