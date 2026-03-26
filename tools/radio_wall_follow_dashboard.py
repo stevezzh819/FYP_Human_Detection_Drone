@@ -22,7 +22,7 @@ SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from radio_wall_follow_mission import check_crazyradio_access, discover_uri
+from radio_wall_follow_mission import discover_uri
 
 
 OUTER_NAMES = {
@@ -192,6 +192,32 @@ def pretty_distance(distance_mm: int) -> str:
     return f"{distance_mm / 10.0:.1f} cm"
 
 
+def summarize_link_error(exc: Exception, uri: str) -> str:
+    message = str(exc)
+    if "\n\nTraceback" in message:
+        message = message.split("\n\nTraceback", 1)[0].strip()
+
+    if "Too many packets lost" in message:
+        return (
+            f"{message}. Move the Crazyflie closer to the Crazyradio, "
+            "verify the battery is connected, and confirm the selected radio URI."
+        )
+
+    if "[Errno 19]" in message and uri.startswith("radio://"):
+        return (
+            "Crazyradio is visible but libusb could not open it. "
+            "Replug the Crazyradio and close any other app that may be using it."
+        )
+
+    if "Could not open usb://0" in message or (uri.startswith("usb://") and "Access denied" in message):
+        return (
+            "Crazyflie USB link could not be opened. "
+            "Replug the Crazyflie USB cable and close any other app using the USB link."
+        )
+
+    return message
+
+
 class RadioSession(threading.Thread):
     def __init__(
         self,
@@ -219,12 +245,6 @@ class RadioSession(threading.Thread):
         self.event_queue.put((event_type, payload))
 
     def run(self) -> None:
-        ok, message = check_crazyradio_access()
-        if not ok:
-            self._emit("status", level="error", message=message)
-            self._emit("disconnected")
-            return
-
         cflib.crtp.init_drivers()
 
         try:
@@ -295,8 +315,11 @@ class RadioSession(threading.Thread):
 
         def set_active_with_retry(active: int) -> None:
             last_error: Optional[Exception] = None
-            for _ in range(5):
+            for _ in range(20):
                 try:
+                    if cf.param.toc.get_element("app", "active") is None:
+                        time.sleep(0.2)
+                        continue
                     cf.param.set_value("app.active", str(active))
                     return
                 except KeyError as exc:
@@ -312,7 +335,9 @@ class RadioSession(threading.Thread):
         self._emit("status", level="info", message=f"Connecting to {uri}")
 
         try:
-            with SyncCrazyflie(uri, cf=cf):
+            with SyncCrazyflie(uri, cf=cf) as scf:
+                scf.wait_for_params()
+
                 mission_cfg = LogConfig(name="mission", period_in_ms=self.log_period_ms)
                 mission_cfg.add_variable("app.stateOuter", "uint8_t")
                 mission_cfg.add_variable("app.mission", "uint8_t")
@@ -373,7 +398,7 @@ class RadioSession(threading.Thread):
                     elif command == "stop":
                         break
         except Exception as exc:
-            self._emit("status", level="error", message=f"Radio session failed: {exc}")
+            self._emit("status", level="error", message=summarize_link_error(exc, uri))
         finally:
             try:
                 set_active_with_retry(0)
@@ -397,11 +422,12 @@ class DashboardApp:
         self.worker: Optional[RadioSession] = None
         self.connected = False
         self.closing = False
+        self.pending_start = False
         self.mission = MissionSnapshot()
         self.flow = FlowSnapshot()
         self.range = RangeSnapshot()
         self.console_lines: list[str] = []
-        self.uri_var = tk.StringVar(value=args.uri or "radio://0/60/2M")
+        self.uri_var = tk.StringVar(value=args.uri or "usb://0")
         self.status_var = tk.StringVar(value="Waiting to connect")
         self.connection_var = tk.StringVar(value="Disconnected")
 
@@ -637,30 +663,21 @@ class DashboardApp:
         self.range_age_value.pack(anchor="w", pady=(4, 0))
 
     def connect(self) -> None:
-        if self.worker and self.worker.is_alive():
-            return
-
-        preferred_uri = self.uri_var.get().strip() or None
-        self.status_var.set("Connecting...")
-        self.connection_var.set("Connecting")
-        self._append_console("Connecting to Crazyflie radio session")
-        self.connect_button.set_state("disabled")
-
-        self.worker = RadioSession(
-            preferred_uri=preferred_uri,
-            cache_dir=self.args.cache,
-            log_period_ms=self.args.log_period_ms,
-            event_queue=self.event_queue,
-        )
-        self.worker.start()
+        self._begin_connection()
 
     def start_mission(self) -> None:
         if not self.worker or not self.connected:
+            self.pending_start = True
+            self._append_console("Start requested without an active link. Reconnecting first.")
+            self._begin_connection()
             return
+
+        self.pending_start = False
         self.worker.request_active(True)
         self._append_console("Start button pressed")
 
     def stop_mission(self) -> None:
+        self.pending_start = False
         if not self.worker or not self.connected:
             return
         self.worker.request_active(False)
@@ -690,11 +707,18 @@ class DashboardApp:
 
     def _handle_connected(self, payload: Dict[str, object]) -> None:
         self.connected = True
-        self.connection_var.set(f"Connected: {payload.get('uri', '')}")
-        self.connect_button.set_state("disabled")
+        connected_uri = str(payload.get("uri", ""))
+        self.uri_var.set(connected_uri)
+        self.connection_var.set(f"Connected: {connected_uri}")
+        self.connect_button.set_state("normal")
         self.start_button.set_state("normal")
         self.stop_button.set_state("normal")
-        self._append_console(f"Connected to {payload.get('uri', '')}")
+        self._append_console(f"Connected to {connected_uri}")
+        if self.pending_start and self.worker:
+            self.pending_start = False
+            self.status_var.set("Link restored. Sending app.active=1")
+            self.worker.request_active(True)
+            self._append_console("Auto-starting mission after reconnect")
 
     def _handle_disconnected(self) -> None:
         self.connected = False
@@ -705,6 +729,38 @@ class DashboardApp:
         if not self.closing:
             self.status_var.set("Disconnected")
             self._append_console("Radio session stopped")
+
+    def _begin_connection(self) -> None:
+        if self.worker and self.worker.is_alive():
+            self.worker.shutdown()
+            self.worker.join(timeout=2.0)
+            if self.worker.is_alive():
+                self.status_var.set("Previous radio session is still shutting down")
+                self._append_console("ERROR: Could not restart connection because the previous session is still alive")
+                return
+
+        self.connected = False
+        self.worker = None
+        preferred_uri = self.uri_var.get().strip() or None
+        if preferred_uri:
+            self.connection_var.set("Connecting")
+            self.status_var.set(f"Connecting to {preferred_uri}...")
+            self._append_console(f"Connecting to {preferred_uri}")
+        else:
+            self.connection_var.set("Scanning")
+            self.status_var.set("Scanning for nearby Crazyflies...")
+            self._append_console("Scanning for nearby Crazyflies")
+        self.connect_button.set_state("disabled")
+        self.start_button.set_state("disabled")
+        self.stop_button.set_state("disabled")
+
+        self.worker = RadioSession(
+            preferred_uri=preferred_uri,
+            cache_dir=self.args.cache,
+            log_period_ms=self.args.log_period_ms,
+            event_queue=self.event_queue,
+        )
+        self.worker.start()
 
     def _pump_events(self) -> None:
         while True:
@@ -796,7 +852,7 @@ class DashboardApp:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tk dashboard for the Crazyflie wall-follow mission")
-    parser.add_argument("--uri", help="Crazyflie link URI. Defaults to radio://0/60/2M.")
+    parser.add_argument("--uri", help="Crazyflie link URI. Defaults to usb://0.")
     parser.add_argument("--cache", default="/Users/zhangzehua/Desktop/fyp/cache", help="TOC cache directory")
     parser.add_argument("--log-period-ms", type=int, default=250, help="Telemetry log period in ms")
     parser.add_argument("--no-auto-connect", dest="auto_connect", action="store_false", help="Open the window without connecting immediately")
