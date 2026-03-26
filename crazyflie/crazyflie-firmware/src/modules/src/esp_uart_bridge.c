@@ -21,7 +21,7 @@
 #include "commander.h"
 #include "crtp_commander_high_level.h"
 
-#define ESP_UART_BRIDGE_BAUDRATE       (115200U)
+#define ESP_UART_BRIDGE_BAUDRATE       (57600U)
 #define ESP_UART_HEADER_BYTE0           (0xAAU)
 #define ESP_UART_HEADER_BYTE1           (0x55U)
 #define ESP_UART_MAX_PAYLOAD            (64U)
@@ -57,13 +57,16 @@ static StaticSemaphore_t stateMutexBuffer;
 static SemaphoreHandle_t stateMutex = NULL;
 
 static bool isInit = false;
-static bool humanDetected = false;
-static uint8_t humanConfidence = 0;
-static uint32_t humanTimestampMs = 0;
+static bool hasHumanSample = false;
+static espUartHumanDetection_t latestHumanSample = {0};
 
 static uint8_t humanDetectedLog = 0;
 static uint8_t humanConfidenceLog = 0;
+static int8_t humanDirectionLog = 0;
+static int16_t humanMaxTempLog = 0;
+static int16_t humanThermistorLog = 0;
 static uint32_t humanTimestampMsLog = 0;
+static uint32_t humanRxLocalTimeMsLog = 0;
 static uint32_t testRxCountLog = 0;
 static uint32_t testTxCountLog = 0;
 static uint32_t beepCountLog = 0;
@@ -276,20 +279,43 @@ static void handlePacket(const espUartPacket_t *packet)
     return;
   }
 
-  const bool detected = (packet->payload[0] != 0U);
-  const uint8_t confidence = packet->payload[1];
-  const uint32_t timestamp = ((uint32_t)packet->payload[6]) |
-                             ((uint32_t)packet->payload[7] << 8U) |
-                             ((uint32_t)packet->payload[8] << 16U) |
-                             ((uint32_t)packet->payload[9] << 24U);
+  espUartHumanDetection_t sample = {0};
+  sample.detected = (packet->payload[0] != 0U);
+  sample.confidence = packet->payload[1];
+  sample.rxLocalTimeMs = T2M(xTaskGetTickCount());
+
+  if (packet->length >= 11U) {
+    sample.direction = (int8_t)packet->payload[2];
+    sample.maxTempX100 = (int16_t)((uint16_t)packet->payload[3] |
+                                   ((uint16_t)packet->payload[4] << 8U));
+    sample.thermistorX100 = (int16_t)((uint16_t)packet->payload[5] |
+                                      ((uint16_t)packet->payload[6] << 8U));
+    sample.sourceTimestampMs = ((uint32_t)packet->payload[7]) |
+                               ((uint32_t)packet->payload[8] << 8U) |
+                               ((uint32_t)packet->payload[9] << 16U) |
+                               ((uint32_t)packet->payload[10] << 24U);
+  } else {
+    sample.direction = 0;
+    sample.maxTempX100 = (int16_t)((uint16_t)packet->payload[2] |
+                                   ((uint16_t)packet->payload[3] << 8U));
+    sample.thermistorX100 = (int16_t)((uint16_t)packet->payload[4] |
+                                      ((uint16_t)packet->payload[5] << 8U));
+    sample.sourceTimestampMs = ((uint32_t)packet->payload[6]) |
+                               ((uint32_t)packet->payload[7] << 8U) |
+                               ((uint32_t)packet->payload[8] << 16U) |
+                               ((uint32_t)packet->payload[9] << 24U);
+  }
 
   if (xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
-    humanDetected = detected;
-    humanConfidence = confidence;
-    humanTimestampMs = timestamp;
-    humanDetectedLog = detected ? 1U : 0U;
-    humanConfidenceLog = confidence;
-    humanTimestampMsLog = timestamp;
+    latestHumanSample = sample;
+    hasHumanSample = true;
+    humanDetectedLog = sample.detected ? 1U : 0U;
+    humanConfidenceLog = sample.confidence;
+    humanDirectionLog = sample.direction;
+    humanMaxTempLog = sample.maxTempX100;
+    humanThermistorLog = sample.thermistorX100;
+    humanTimestampMsLog = sample.sourceTimestampMs;
+    humanRxLocalTimeMsLog = sample.rxLocalTimeMs;
     xSemaphoreGive(stateMutex);
   }
 }
@@ -359,20 +385,19 @@ void espUartBridgeTask(void *param)
 
     if ((now - lastStatusLog) > pdMS_TO_TICKS(2000)) {
       lastStatusLog = now;
-      DEBUG_PRINT("ESP UART bridge alive: detected=%u conf=%u testRx=%lu testTx=%lu\n",
+      DEBUG_PRINT("ESP UART bridge alive: detected=%u conf=%u dir=%d testRx=%lu testTx=%lu\n",
                   (unsigned)humanDetectedLog,
                   (unsigned)humanConfidenceLog,
+                  (int)humanDirectionLog,
                   (unsigned long)testRxCountLog,
                   (unsigned long)testTxCountLog);
     }
   }
 }
 
-bool espUartBridgeGetLatestHumanDetection(bool *detected,
-                                          uint8_t *confidence,
-                                          uint32_t *timestamp_ms)
+bool espUartBridgeGetLatestHumanDetectionSample(espUartHumanDetection_t *sample)
 {
-  if (!isInit) {
+  if ((!isInit) || (sample == NULL)) {
     return false;
   }
 
@@ -380,17 +405,40 @@ bool espUartBridgeGetLatestHumanDetection(bool *detected,
     return false;
   }
 
-  if (detected != NULL) {
-    *detected = humanDetected;
-  }
-  if (confidence != NULL) {
-    *confidence = humanConfidence;
-  }
-  if (timestamp_ms != NULL) {
-    *timestamp_ms = humanTimestampMs;
+  const bool isValid = hasHumanSample;
+  if (isValid) {
+    *sample = latestHumanSample;
   }
 
   xSemaphoreGive(stateMutex);
+  return isValid;
+}
+
+bool espUartBridgeGetLatestHumanDetection(bool *detected,
+                                          uint8_t *confidence,
+                                          uint32_t *timestamp_ms)
+{
+  espUartHumanDetection_t sample = {0};
+  if (!espUartBridgeGetLatestHumanDetectionSample(&sample)) {
+    return false;
+  }
+
+  bool freshDetected = sample.detected;
+  uint8_t freshConfidence = sample.confidence;
+  if ((T2M(xTaskGetTickCount()) - sample.rxLocalTimeMs) > 300U) {
+    freshDetected = false;
+    freshConfidence = 0U;
+  }
+
+  if (detected != NULL) {
+    *detected = freshDetected;
+  }
+  if (confidence != NULL) {
+    *confidence = freshConfidence;
+  }
+  if (timestamp_ms != NULL) {
+    *timestamp_ms = sample.sourceTimestampMs;
+  }
   return true;
 }
 
@@ -427,7 +475,11 @@ bool espUartBridgeSendPacket(uint8_t type, const uint8_t *payload, uint8_t lengt
 LOG_GROUP_START(espUart)
 LOG_ADD(LOG_UINT8, detected, &humanDetectedLog)
 LOG_ADD(LOG_UINT8, confidence, &humanConfidenceLog)
+LOG_ADD(LOG_INT8, direction, &humanDirectionLog)
+LOG_ADD(LOG_INT16, maxTemp, &humanMaxTempLog)
+LOG_ADD(LOG_INT16, therm, &humanThermistorLog)
 LOG_ADD(LOG_UINT32, timestampMs, &humanTimestampMsLog)
+LOG_ADD(LOG_UINT32, rxLocalMs, &humanRxLocalTimeMsLog)
 LOG_ADD(LOG_UINT32, testRxCount, &testRxCountLog)
 LOG_ADD(LOG_UINT32, testTxCount, &testTxCountLog)
 LOG_ADD(LOG_UINT32, beepCount, &beepCountLog)

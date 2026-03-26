@@ -21,133 +21,108 @@
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  *
- *
- * wall_follower.c - App layer application of the wall following demo. The crazyflie 
- * has to have the multiranger and the flowdeck version 2.
- *
- * The same wallfollowing strategy was used in the following paper:
-
- @article{mcguire2019minimal,
-  title={Minimal navigation solution for a swarm of tiny flying robots to explore an unknown environment},
-  author={McGuire, KN and De Wagter, Christophe and Tuyls, Karl and Kappen, HJ and de Croon, Guido CHE},
-  journal={Science Robotics},
-  volume={4},
-  number={35},
-  year={2019},
-  publisher={Science Robotics}
-}
-
+ * wall_follower.c - App layer application of the wall following demo. The
+ * Crazyflie requires the multiranger and the flowdeck v2.
  */
 
-#include <string.h>
-#include <stdint.h>
+#include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
 
 #include "app.h"
-
 #include "commander.h"
-
-#include "FreeRTOS.h"
-#include "task.h"
-
 #include "debug.h"
-
+#include "FreeRTOS.h"
 #include "log.h"
 #include "param.h"
-#include <math.h>
+#include "task.h"
 #include "usec_time.h"
-
 #include "wallfollowing_multiranger_onboard.h"
 
 #define DEBUG_MODULE "WALLFOLLOWING"
 
-#define MAX(a,b) ((a>b)?a:b)
-#define MIN(a,b) ((a<b)?a:b)
-
-// ===================== Parameters =====================
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 static const float spHeight = 0.5f;
-static const uint16_t radius = 300;
+static const uint16_t radius = 300U;
 
-static const float WALLFOLLOW_TIME = 10.0f;  // changed from 5.0f
-static const float SCAN_TIME = 10.0f;  // changed from 5.0f
+static const float WALLFOLLOW_TIME = 10.0f;
+static const float SCAN_TIME = 10.0f;
 static const float TRANSITION_TIME = 0.35f;
-static const float HUMAN_LOST_TIMEOUT = 1.5f;
+static const uint32_t HUMAN_PACKET_STALE_TIMEOUT_MS = 300U;
+static const float HUMAN_CONFIRM_TIME = 3.0f;
+static const float SIGNAL_BOB_AMPLITUDE = 0.05f;
+static const float SIGNAL_HALF_CYCLE = 0.45f;
+static const uint8_t SIGNAL_BOB_COUNT = 3U;
+static const float LAND_DESCENT_RATE = 0.20f;
+static const float LAND_COMPLETE_HEIGHT = 0.08f;
 
 static const float BATTERY_CUTOFF = 2.8f;
 
-static const float OBSTACLE_STOP_DIST = 0.30f;  // 30cm safety distance (to stop scanning and go back to wall-following)
+static const float AVOID_RADIUS = 0.4f;
+static const float AVOID_VEL_MAX = 0.3f;
+static const float AVOID_VEL_CLAMP = 0.25f;
 
-// Push-style avoidance parameters
-static const float AVOID_RADIUS = 0.4f;   // meters
-static const float AVOID_VEL_MAX = 0.3f;  // max avoidance velocity
+static bool goLeft = false;
+static float distanceToWall = 0.5f;
+static float maxForwardSpeed = 0.25f;
+static uint8_t appActive = 0U;
 
-// ===================== Wall follow parameters =====================
+static uint8_t humanDetected = 0U;
+static uint8_t humanConfidence = 0U;
+static int8_t humanDir = 0;
+static uint8_t humanPacketFresh = 0U;
+static uint32_t humanAgeMs = 0U;
+static int16_t humanMaxTempX100 = 0;
+static int16_t humanThermistorX100 = 0;
+static float humanHoldTimeS = 0.0f;
+static uint8_t humanStable = 0U;
 
-bool goLeft = false;
-float distanceToWall = 0.5f;  // Target distance that the Crazyflie tries to maintain from the wall while following it.
-float maxForwardSpeed = 0.25f;
+static float cmdVelX = 0.0f;
+static float cmdVelY = 0.0f;
+static float cmdYawRateDeg = 0.0f;
 
-// ===================== Python control =====================
-
-uint8_t appActive = 0;
-
-// ===================== Thermal perception =====================
-
-uint8_t humanDetected = 0;
-int8_t humanDir = 0;          // -1 left, 0 center, +1 right
-float humanStandOff = 1.0f;  // Desired distance that the drone should keep from a detected human (should NOT be too close for safety)
-
-// ===================== Command variables =====================
-
-float cmdVelX = 0.0f;
-float cmdVelY = 0.0f;
-float cmdYawRateDeg = 0.0f;
-
-// ===================== Outer loop =====================
+typedef struct {
+  logVarId_t detected;
+  logVarId_t confidence;
+  logVarId_t direction;
+  logVarId_t maxTemp;
+  logVarId_t therm;
+  logVarId_t rxLocalMs;
+} EspUartLogIds;
 
 typedef enum
 {
   idle,
   unlocked,
   stopping
-} StateOuterLoop;  // lowUnlock was removed because we don't want the Crazyflie to start up using the hand unlock anymore (for safety).
-
-static StateOuterLoop stateOuterLoop = idle;
-
-// ===================== Mission FSM =====================
+} StateOuterLoop;
 
 typedef enum
 {
   mission_reacquire_wall,
   mission_wallfollow,
   mission_scan,
-  mission_approach,
-  mission_bob,
-  mission_track,
+  mission_signal,
+  mission_land,
   mission_transition
 } MissionState;
 
-static MissionState missionState = mission_reacquire_wall;  // what the drone is doing
-static MissionState nextMissionState;  // what it will do next
-
-static float missionStateStart = 0;  // when the current task started
-static float lastHumanSeen = -1;  // when the human was last detected
-
-// ===================== Wall follower =====================
-
+static StateOuterLoop stateOuterLoop = idle;
+static MissionState missionState = mission_reacquire_wall;
+static MissionState nextMissionState = mission_reacquire_wall;
 static StateWF stateInnerLoop = forward;
 
-// ===================== Detection debounce =====================
-
-static uint8_t humanSeenCount = 0;
-#define HUMAN_CONFIRM_FRAMES 3
-
-// ===================== Helpers =====================
+static float missionStateStart = 0.0f;
+static float humanDetectStart = -1.0f;
 
 static void setVelocitySetpoint(setpoint_t *setpoint,
-                                float vx, float vy,
-                                float z, float yawrate)
+                                float vx,
+                                float vy,
+                                float z,
+                                float yawrate)
 {
   setpoint->mode.z = modeAbs;
   setpoint->position.z = z;
@@ -160,7 +135,6 @@ static void setVelocitySetpoint(setpoint_t *setpoint,
 
   setpoint->velocity.x = vx;
   setpoint->velocity.y = vy;
-
   setpoint->velocity_body = true;
 }
 
@@ -171,148 +145,158 @@ static void missionTransition(MissionState next, float now)
   missionStateStart = now;
 }
 
-static void resetWallFollower()
+static void resetWallFollower(void)
 {
   stateInnerLoop = forward;
   wallFollowerInit(distanceToWall, maxForwardSpeed, stateInnerLoop);
 }
 
-// ===================== Main =====================
+static bool espUartLogIdsReady(const EspUartLogIds *ids)
+{
+  return logVarIdIsValid(ids->detected) &&
+         logVarIdIsValid(ids->confidence) &&
+         logVarIdIsValid(ids->direction) &&
+         logVarIdIsValid(ids->maxTemp) &&
+         logVarIdIsValid(ids->therm) &&
+         logVarIdIsValid(ids->rxLocalMs);
+}
 
-void appMain()
+static void updateHumanPerception(const EspUartLogIds *ids, uint32_t nowMs)
+{
+  if (!espUartLogIdsReady(ids)) {
+    return;
+  }
+
+  humanDetected = 0U;
+  humanConfidence = 0U;
+  humanDir = 0;
+  humanPacketFresh = 0U;
+  humanAgeMs = 0U;
+  humanMaxTempX100 = 0;
+  humanThermistorX100 = 0;
+
+  humanMaxTempX100 = (int16_t)logGetInt(ids->maxTemp);
+  humanThermistorX100 = (int16_t)logGetInt(ids->therm);
+
+  const uint32_t rxLocalMs = logGetUint(ids->rxLocalMs);
+  if (rxLocalMs == 0U) {
+    return;
+  }
+
+  humanAgeMs = nowMs - rxLocalMs;
+
+  if (humanAgeMs > HUMAN_PACKET_STALE_TIMEOUT_MS) {
+    return;
+  }
+
+  humanPacketFresh = 1U;
+  humanConfidence = (uint8_t)logGetUint(ids->confidence);
+  humanDir = (int8_t)logGetInt(ids->direction);
+  if (logGetUint(ids->detected) != 0U) {
+    humanDetected = 1U;
+  }
+}
+
+void appMain(void)
 {
   vTaskDelay(M2T(3000));
-  // Getting Logging IDs of the multiranger
-  logVarId_t idUp = logGetVarId("range","up");
-  logVarId_t idLeft = logGetVarId("range","left");
-  logVarId_t idRight = logGetVarId("range","right");
-  logVarId_t idFront = logGetVarId("range","front");
-  logVarId_t idBack  = logGetVarId("range","back");
 
-  // Getting the Logging IDs of the state estimates
-  logVarId_t idYaw = logGetVarId("stabilizer","yaw");
-  logVarId_t idHeight = logGetVarId("stateEstimate","z");
+  logVarId_t idUp = logGetVarId("range", "up");
+  logVarId_t idLeft = logGetVarId("range", "left");
+  logVarId_t idRight = logGetVarId("range", "right");
+  logVarId_t idFront = logGetVarId("range", "front");
+  logVarId_t idBack = logGetVarId("range", "back");
 
-  logVarId_t idVbat = logGetVarId("pm","vbat");
+  logVarId_t idYaw = logGetVarId("stabilizer", "yaw");
+  logVarId_t idHeight = logGetVarId("stateEstimate", "z");
+  logVarId_t idVbat = logGetVarId("pm", "vbat");
+  EspUartLogIds espUartIds = {
+    .detected = logGetVarId("espUart", "detected"),
+    .confidence = logGetVarId("espUart", "confidence"),
+    .direction = logGetVarId("espUart", "direction"),
+    .maxTemp = logGetVarId("espUart", "maxTemp"),
+    .therm = logGetVarId("espUart", "therm"),
+    .rxLocalMs = logGetVarId("espUart", "rxLocalMs"),
+  };
 
-  // Getting Param IDs of the deck driver initialization
-  paramVarId_t idPositioningDeck = paramGetVarId("deck","bcFlow2");
-  paramVarId_t idMultiranger = paramGetVarId("deck","bcMultiranger");
+  paramVarId_t idPositioningDeck = paramGetVarId("deck", "bcFlow2");
+  paramVarId_t idMultiranger = paramGetVarId("deck", "bcMultiranger");
 
-  // Intialize the setpoint structure
-  setpoint_t setpoint;
+  setpoint_t setpoint = {0};
 
-  resetWallFollower();  // Initialize the wall follower state machine
+  resetWallFollower();
 
-  DEBUG_PRINT("Waiting for activation. Press 'Enter' to start.\n");
-  while(1)
-  {
+  DEBUG_PRINT("Waiting for activation via app.active\n");
+
+  while (1) {
     vTaskDelay(M2T(10));
 
-    // Check if decks are properly mounted
-    uint8_t positioningInit = paramGetUint(idPositioningDeck);
-    uint8_t multirangerInit = paramGetUint(idMultiranger);
+    const uint8_t positioningInit = paramGetUint(idPositioningDeck);
+    const uint8_t multirangerInit = paramGetUint(idMultiranger);
+    const uint16_t up = logGetUint(idUp);
+    const float heightEstimate = logGetFloat(idHeight);
+    const float vbat = logGetFloat(idVbat);
+    const float timeNow = usecTimestamp() / 1e6f;
+    const uint32_t nowMs = T2M(xTaskGetTickCount());
 
-    // Get the upper range sensor value (used for stopping)
-    uint16_t up = logGetUint(idUp);
+    updateHumanPerception(&espUartIds, nowMs);
 
-    // Get Height estimate
-    float heightEstimate = logGetFloat(idHeight);
-    
-    float vbat = logGetFloat(idVbat);
-
-    if(vbat < BATTERY_CUTOFF && vbat > 0.1f)
+    if ((vbat < BATTERY_CUTOFF) && (vbat > 0.1f)) {
       stateOuterLoop = stopping;
+    }
 
-    // ===================== OUTER LOOP =====================
-
-    // -------- IDLE STATE --------
-    if(stateOuterLoop == idle)
-    {
-      // Start only by Python
-      if(appActive && positioningInit && multirangerInit)
-      {
+    if (stateOuterLoop == idle) {
+      if (appActive && positioningInit && multirangerInit) {
         stateOuterLoop = unlocked;
-
         resetWallFollower();
-
         missionState = mission_reacquire_wall;
-        missionStateStart = usecTimestamp()/1e6f;
-
-        DEBUG_PRINT("Unlocked by Python script\n");
+        nextMissionState = mission_reacquire_wall;
+        missionStateStart = timeNow;
+        humanDetectStart = -1.0f;
+        humanHoldTimeS = 0.0f;
+        humanStable = 0U;
+        DEBUG_PRINT("App activated\n");
       }
-    }
-
-
-    // -------- NORMAL FLIGHT --------
-    else if(stateOuterLoop == unlocked)
-    {
-      // Python stop
-      if(!appActive)
-      {
+    } else if (stateOuterLoop == unlocked) {
+      if (!appActive) {
         stateOuterLoop = idle;
-        DEBUG_PRINT("Stopped by Python script\n");
+        DEBUG_PRINT("App deactivated\n");
       }
 
-      // Emergency stop using hand above sensor
-      if(up < 200)
-      {
+      if (up < 200U) {
         stateOuterLoop = stopping;
-        DEBUG_PRINT("Emergency stop (hand detected)\n");
+        DEBUG_PRINT("Emergency stop from top ranger\n");
       }
-    }
-
-
-    // -------- STOPPING STATE --------
-    else if(stateOuterLoop == stopping)
-    {
-      // Wait until hand removed
-      if(up > 500)
-      {
+    } else if (stateOuterLoop == stopping) {
+      if (up > 500U) {
         stateOuterLoop = idle;
-
-        // Force Python restart
-        appActive = 0;
-
+        appActive = 0U;
         DEBUG_PRINT("Stopped\n");
       }
     }
 
-
-    // -------- DISARM MOTORS IF NOT UNLOCKED --------
-    if(stateOuterLoop != unlocked)
-    {
-      memset(&setpoint,0,sizeof(setpoint));
-      commanderSetSetpoint(&setpoint,3);
+    if (stateOuterLoop != unlocked) {
+      cmdVelX = 0.0f;
+      cmdVelY = 0.0f;
+      cmdYawRateDeg = 0.0f;
+      memset(&setpoint, 0, sizeof(setpoint));
+      commanderSetSetpoint(&setpoint, COMMANDER_PRIORITY_EXTRX);
       continue;
     }
 
-    // ===================== Sensor reads =====================
+    const float frontRange = logGetUint(idFront) / 1000.0f;
+    const float leftRange = logGetUint(idLeft) / 1000.0f;
+    const float rightRange = logGetUint(idRight) / 1000.0f;
+    const float backRange = logGetUint(idBack) / 1000.0f;
+    const float sideRange = goLeft ? rightRange : leftRange;
+    const float yawDeg = logGetFloat(idYaw);
+    const float yawRad = yawDeg * (float)M_PI / 180.0f;
+    const int direction = goLeft ? 1 : -1;
 
-    float frontRange = logGetUint(idFront)/1000.0f;
-    float leftRange  = logGetUint(idLeft)/1000.0f;
-    float rightRange = logGetUint(idRight)/1000.0f;
-    float backRange  = logGetUint(idBack)/1000.0f;
-    // float upRange    = logGetUint(idUp)/1000.0f;
+    const uint16_t upOffset = radius - MIN(up, radius);
+    float cmdHeight = spHeight - ((float)upOffset / 1000.0f);
 
-    float sideRange;
-
-    if(goLeft)
-      sideRange = logGetUint(idRight)/1000.0f;
-    else
-      sideRange = logGetUint(idLeft)/1000.0f;
-
-    float yawDeg = logGetFloat(idYaw);
-    float yawRad = yawDeg * (float)M_PI / 180.0f;
-
-    float timeNow = usecTimestamp()/1e6f;
-
-    //Adjust height based on up ranger input
-    uint16_t up_o = radius - MIN(up,radius);
-    float cmdHeight = spHeight - up_o/1000.0f;
-
-    if(cmdHeight < spHeight - 0.2f)
-    {
+    if (cmdHeight < (spHeight - 0.2f)) {
       stateOuterLoop = stopping;
       continue;
     }
@@ -321,350 +305,245 @@ void appMain()
     cmdVelY = 0.0f;
     cmdYawRateDeg = 0.0f;
 
-    if(humanDetected)
-      lastHumanSeen = timeNow;
-
-    int direction = goLeft ? 1 : -1;
-
-    // ===================== Mission FSM =====================
-
-    if(heightEstimate > spHeight - 0.1f)
-    {
-
-      switch(missionState)
-      {
-
-      case mission_transition:  // To let the drone hover in between states
-      {
-        cmdVelX = 0.0f;
-        cmdVelY = 0.0f;
-        cmdYawRateDeg = 0.0f;
-
-        if(timeNow - missionStateStart > TRANSITION_TIME)
-        {
-          if(nextMissionState == mission_reacquire_wall)
-            resetWallFollower();
-
-          missionState = nextMissionState;
-          missionStateStart = timeNow;
-        }
+    if (humanDetected) {
+      if (humanDetectStart < 0.0f) {
+        humanDetectStart = timeNow;
       }
-      break;
+      humanHoldTimeS = timeNow - humanDetectStart;
+      humanStable = (humanHoldTimeS >= HUMAN_CONFIRM_TIME) ? 1U : 0U;
+    } else {
+      humanDetectStart = -1.0f;
+      humanHoldTimeS = 0.0f;
+      humanStable = 0U;
+    }
 
-      // ===================== REACQUIRE WALL =====================
+    if (heightEstimate > (spHeight - 0.1f)) {
+      switch (missionState) {
+        case mission_transition:
+          if ((timeNow - missionStateStart) > TRANSITION_TIME) {
+            if (nextMissionState == mission_reacquire_wall) {
+              resetWallFollower();
+            }
+            missionState = nextMissionState;
+            missionStateStart = timeNow;
+          }
+          break;
 
-      case mission_reacquire_wall:
-      {
-        // If wall already beside us, resume wall following
-        if(sideRange < distanceToWall + 0.3f)
-        {
-          missionTransition(mission_wallfollow,timeNow);
+        case mission_reacquire_wall: {
+          if (sideRange < (distanceToWall + 0.3f)) {
+            missionTransition(mission_wallfollow, timeNow);
+            break;
+          }
+
+          float yawRadCmd = 0.0f;
+          stateInnerLoop = wallFollower(&cmdVelX,
+                                        &cmdVelY,
+                                        &yawRadCmd,
+                                        frontRange,
+                                        sideRange,
+                                        yawRad,
+                                        direction,
+                                        timeNow);
+          cmdYawRateDeg = yawRadCmd * 180.0f / (float)M_PI;
+
+          if (stateInnerLoop == forwardAlongWall) {
+            missionTransition(mission_wallfollow, timeNow);
+          }
           break;
         }
 
-        float yawRadCmd;
+        case mission_wallfollow: {
+          float yawRadCmd = 0.0f;
+          stateInnerLoop = wallFollower(&cmdVelX,
+                                        &cmdVelY,
+                                        &yawRadCmd,
+                                        frontRange,
+                                        sideRange,
+                                        yawRad,
+                                        direction,
+                                        timeNow);
+          cmdYawRateDeg = yawRadCmd * 180.0f / (float)M_PI;
 
-        stateInnerLoop = wallFollower(&cmdVelX,&cmdVelY,&yawRadCmd,
-                                      frontRange,sideRange,yawRad,
-                                      direction,timeNow);
-
-        cmdYawRateDeg = yawRadCmd * 180.0f/(float)M_PI;
-
-        if(stateInnerLoop == forwardAlongWall)  // Wall follower has successfully locked onto a wall
-        {
-          missionTransition(mission_wallfollow,timeNow);
-        }
-      }
-      break;
-
-      // ===================== WALL FOLLOW =====================
-
-      case mission_wallfollow:
-      {
-        float yawRadCmd;
-
-        stateInnerLoop = wallFollower(&cmdVelX,&cmdVelY,&yawRadCmd,
-                                      frontRange,sideRange,yawRad,
-                                      direction,timeNow);
-
-        cmdYawRateDeg = yawRadCmd * 180.0f/(float)M_PI;
-
-        if(humanDetected)
-        {
-          humanSeenCount++;
-
-          if(humanSeenCount >= HUMAN_CONFIRM_FRAMES)
-            missionTransition(mission_approach,timeNow);
-        }
-        else
-          humanSeenCount = 0;
-
-        if(timeNow - missionStateStart > WALLFOLLOW_TIME)
-        {
-          missionTransition(mission_scan,timeNow);
-        }
-      }
-      break;
-
-      // ===================== SCAN =====================
-      case mission_scan:
-      {
-          float minDist = MIN(
-                              MIN(frontRange, backRange),
-                              MIN(leftRange, rightRange)
-                            );
-
-          // ===== ESCAPE if too close =====
-          if (minDist < 0.25f)
-          {
-              // float factor = 0.2f;
-              float factor = 0.1f;
-
-              float f_o = MAX(0.0f, 0.4f - frontRange);
-              float b_o = MAX(0.0f, 0.4f - backRange);
-              float l_o = MAX(0.0f, 0.4f - leftRange);
-              float r_o = MAX(0.0f, 0.4f - rightRange);
-
-              // cmdVelX = (b_o - f_o) * factor;
-              // cmdVelY = (r_o - l_o) * factor;
-              cmdVelX += (b_o - f_o) * factor;  // additive
-              cmdVelY += (r_o - l_o) * factor;  // additive
-              cmdYawRateDeg = 0.0f;
-
-              break;
+          if ((timeNow - missionStateStart) > WALLFOLLOW_TIME) {
+            missionTransition(mission_scan, timeNow);
           }
+          break;
+        }
 
-          // ===== Distance-aware rotation =====
-          // float safeDist = 0.5f;
-          // float stopDist = 0.25f;
+        case mission_scan: {
+          const float minDist = MIN(MIN(frontRange, backRange), MIN(leftRange, rightRange));
 
-          // float scale = (minDist - stopDist) / (safeDist - stopDist);
-          // scale = MAX(0.0f, MIN(scale, 1.0f));
-          // cmdYawRateDeg = 36.0f * scale;
+          if (minDist < 0.25f) {
+            const float factor = 0.1f;
+            const float f_o = MAX(0.0f, 0.4f - frontRange);
+            const float b_o = MAX(0.0f, 0.4f - backRange);
+            const float l_o = MAX(0.0f, 0.4f - leftRange);
+            const float r_o = MAX(0.0f, 0.4f - rightRange);
+
+            cmdVelX += (b_o - f_o) * factor;
+            cmdVelY += (r_o - l_o) * factor;
+            break;
+          }
 
           cmdYawRateDeg = 36.0f;
-          // Optional slight drift
-          // cmdVelX = 0.03f;
 
-          // ===== Human detection =====
-          if(humanDetected)
-          {
-              humanSeenCount++;
-              if(humanSeenCount >= HUMAN_CONFIRM_FRAMES)
-              {
-                  humanSeenCount = 0;
-                  missionTransition(mission_approach,timeNow);
-              }
+          if ((timeNow - missionStateStart) > SCAN_TIME) {
+            missionTransition(mission_reacquire_wall, timeNow);
           }
-          else
-          {
-              humanSeenCount = 0;
+          break;
+        }
+
+        case mission_signal: {
+          const float signalTime = timeNow - missionStateStart;
+          const uint8_t halfCycle = (uint8_t)(signalTime / SIGNAL_HALF_CYCLE);
+          if (halfCycle >= (uint8_t)(SIGNAL_BOB_COUNT * 2U)) {
+            cmdHeight = spHeight;
+            missionTransition(mission_land, timeNow);
+          } else if ((halfCycle % 2U) == 0U) {
+            cmdHeight = spHeight + SIGNAL_BOB_AMPLITUDE;
+          } else {
+            cmdHeight = spHeight - SIGNAL_BOB_AMPLITUDE;
+          }
+          break;
+        }
+
+        case mission_land: {
+          cmdHeight = spHeight - (LAND_DESCENT_RATE * (timeNow - missionStateStart));
+          if (cmdHeight < 0.05f) {
+            cmdHeight = 0.05f;
           }
 
-          if(timeNow - missionStateStart > SCAN_TIME)
-          {
-              missionTransition(mission_reacquire_wall,timeNow);
+          if ((heightEstimate < LAND_COMPLETE_HEIGHT) || ((up > 0U) && (up < 120U))) {
+            appActive = 0U;
+            stateOuterLoop = idle;
+            missionState = mission_reacquire_wall;
+            nextMissionState = mission_reacquire_wall;
+            humanDetectStart = -1.0f;
+            humanHoldTimeS = 0.0f;
+            humanStable = 0U;
+            cmdVelX = 0.0f;
+            cmdVelY = 0.0f;
+            cmdYawRateDeg = 0.0f;
+            resetWallFollower();
+            memset(&setpoint, 0, sizeof(setpoint));
+            commanderSetSetpoint(&setpoint, COMMANDER_PRIORITY_EXTRX);
+            DEBUG_PRINT("Mission landed\n");
+            continue;
           }
-      }
-      break;
-
-      // case mission_scan:
-      // {
-      //   cmdVelX = 0.0f;
-      //   cmdVelY = 0.0f;
-      //   cmdYawRateDeg = 36.0f;  // changed from 72.0f
-
-      //   // Safety check for obstacles
-      //   if(frontRange < OBSTACLE_STOP_DIST || sideRange < OBSTACLE_STOP_DIST)
-      //   {
-      //     missionTransition(mission_reacquire_wall,timeNow);
-      //     break;
-      //   }
-
-      //   if(humanDetected)
-      //   {
-      //     humanSeenCount++;
-
-      //     if(humanSeenCount >= HUMAN_CONFIRM_FRAMES)
-      //     {
-      //       humanSeenCount = 0;
-      //       missionTransition(mission_approach,timeNow);
-      //     }
-      //   }
-      //   else
-      //     humanSeenCount = 0;
-
-      //   if(timeNow - missionStateStart > SCAN_TIME)
-      //   {
-      //     missionTransition(mission_reacquire_wall,timeNow);
-      //   }
-      // }
-      // break;
-
-      // ===================== APPROACH ===================== (should not be triggered yet since thermal sensor is not integrated yet)
-
-      case mission_approach:
-      {
-        cmdYawRateDeg = 20 * humanDir;
-
-        float margin = 0.15f;
-
-        if(frontRange > humanStandOff + margin)
-          cmdVelX = 0.15f;
-        else if(frontRange < humanStandOff - margin)
-          cmdVelX = -0.1f;
-        else
-        {
-          cmdVelX = 0;
-          missionTransition(mission_bob,timeNow);
+          break;
         }
-
-        if(!humanDetected && timeNow - lastHumanSeen > HUMAN_LOST_TIMEOUT)
-        {
-          missionTransition(mission_reacquire_wall,timeNow);
-        }
-      }
-      break;
-
-      // ===================== BOB =====================
-
-      case mission_bob:
-      {
-        float t = timeNow - missionStateStart;
-
-        if(t < 0.4f)
-          cmdHeight = spHeight + 0.1f;
-        else if(t < 0.8f)
-          cmdHeight = spHeight - 0.1f;
-        else
-        {
-          cmdHeight = spHeight;
-          missionTransition(mission_track,timeNow);
-        }
-      }
-      break;
-
-      // ===================== TRACK =====================
-
-      case mission_track:
-      {
-        if(humanDetected)
-        {
-          cmdYawRateDeg = 15 * humanDir;
-
-          float margin = 0.15f;
-
-          if(frontRange > humanStandOff + margin)
-            cmdVelX = 0.08f;
-          else if(frontRange < humanStandOff - margin)
-            cmdVelX = -0.08f;
-        }
-        else
-        {
-          if(timeNow - lastHumanSeen > HUMAN_LOST_TIMEOUT)
-            missionTransition(mission_reacquire_wall,timeNow);
-        }
-      }
-      break;
-
       }
     }
 
-    /* ===================== SMOOTH OBSTACLE AVOIDANCE ===================== */
-    // Scale factor (same idea as push demo)
-    float factor = AVOID_VEL_MAX / AVOID_RADIUS;
+    if ((missionState != mission_transition) &&
+        (missionState != mission_signal) &&
+        (missionState != mission_land) &&
+        humanStable) {
+      missionTransition(mission_signal, timeNow);
+    }
 
-    // Clamp distances to radius
-    float f = MIN(frontRange, AVOID_RADIUS);
-    float l = MIN(leftRange,  AVOID_RADIUS);
-    float r = MIN(rightRange, AVOID_RADIUS);
-    float b = MIN(backRange,  AVOID_RADIUS);
+    const bool holdStill = (missionState == mission_signal) || (missionState == mission_land);
 
-    // Compute "intrusion" (how close obstacle is)
-    float f_o = AVOID_RADIUS - f;
-    float l_o = AVOID_RADIUS - l;
-    float r_o = AVOID_RADIUS - r;
-    float b_o = AVOID_RADIUS - b;
+    if (!holdStill) {
+      const float factor = AVOID_VEL_MAX / AVOID_RADIUS;
+      const float f = MIN(frontRange, AVOID_RADIUS);
+      const float l = MIN(leftRange, AVOID_RADIUS);
+      const float r = MIN(rightRange, AVOID_RADIUS);
+      const float b = MIN(backRange, AVOID_RADIUS);
 
-    // Convert to velocities (same logic as push.c)
-    float avoidX = (-1.0f) * f_o * factor;
-    avoidX += b_o * factor;
-    
-    float avoidY = (r_o - l_o) * factor;
+      const float f_o = AVOID_RADIUS - f;
+      const float l_o = AVOID_RADIUS - l;
+      const float r_o = AVOID_RADIUS - r;
+      const float b_o = AVOID_RADIUS - b;
 
-    // === BLENDING WITH EXISTING COMMANDS ===
+      float avoidX = (-1.0f * f_o * factor) + (b_o * factor);
+      float avoidY = (r_o - l_o) * factor;
 
-    // Weight avoidance stronger when very close
-    // float weight = MAX(f_o, MAX(l_o, r_o)) / AVOID_RADIUS;
-    float weight = MAX(MAX(f_o, b_o), MAX(l_o, r_o)) / AVOID_RADIUS;
-    weight = MIN(weight, 1.0f);
+      float weight = MAX(MAX(f_o, b_o), MAX(l_o, r_o)) / AVOID_RADIUS;
+      weight = MIN(weight, 1.0f);
 
-    // Blend instead of hard override
-    cmdVelX = (1.0f - weight) * cmdVelX + weight * avoidX;
-    cmdVelY = (1.0f - weight) * cmdVelY + weight * avoidY;
+      cmdVelX = ((1.0f - weight) * cmdVelX) + (weight * avoidX);
+      cmdVelY = ((1.0f - weight) * cmdVelY) + (weight * avoidY);
 
-    // Optional: clamp velocity
-    cmdVelX = MAX(MIN(cmdVelX, 0.25f), -0.25f);
-    cmdVelY = MAX(MIN(cmdVelY, 0.25f), -0.25f);
+      cmdVelX = MAX(MIN(cmdVelX, AVOID_VEL_CLAMP), -AVOID_VEL_CLAMP);
+      cmdVelY = MAX(MIN(cmdVelY, AVOID_VEL_CLAMP), -AVOID_VEL_CLAMP);
+    } else {
+      cmdVelX = 0.0f;
+      cmdVelY = 0.0f;
+    }
 
-    /* =================================================================== */
+    {
+      static float prevCmdX = 0.0f;
+      static float prevCmdY = 0.0f;
+      if (holdStill) {
+        prevCmdX = 0.0f;
+        prevCmdY = 0.0f;
+        cmdVelX = 0.0f;
+        cmdVelY = 0.0f;
+      } else {
+        const float maxDelta = 0.05f;
+        float dx = cmdVelX - prevCmdX;
+        float dy = cmdVelY - prevCmdY;
 
-    // ================= ACCELERATION LIMIT =================
-    static float prevCmdX = 0.0f;
-    static float prevCmdY = 0.0f;
+        if (dx > maxDelta) {
+          dx = maxDelta;
+        } else if (dx < -maxDelta) {
+          dx = -maxDelta;
+        }
 
-    float maxDelta = 0.05f;  // tune this (0.03–0.07 range)
+        if (dy > maxDelta) {
+          dy = maxDelta;
+        } else if (dy < -maxDelta) {
+          dy = -maxDelta;
+        }
 
-    // Compute change
-    float dx = cmdVelX - prevCmdX;
-    float dy = cmdVelY - prevCmdY;
+        cmdVelX = prevCmdX + dx;
+        cmdVelY = prevCmdY + dy;
+        prevCmdX = cmdVelX;
+        prevCmdY = cmdVelY;
+      }
+    }
 
-    // Clamp change
-    if (dx > maxDelta) dx = maxDelta;
-    if (dx < -maxDelta) dx = -maxDelta;
+    {
+      static float prevX = 0.0f;
+      static float prevY = 0.0f;
+      if (holdStill) {
+        prevX = 0.0f;
+        prevY = 0.0f;
+      } else {
+        cmdVelX = (0.7f * prevX) + (0.3f * cmdVelX);
+        cmdVelY = (0.7f * prevY) + (0.3f * cmdVelY);
+        prevX = cmdVelX;
+        prevY = cmdVelY;
+      }
+    }
 
-    if (dy > maxDelta) dy = maxDelta;
-    if (dy < -maxDelta) dy = -maxDelta;
-
-    // Apply limited change
-    cmdVelX = prevCmdX + dx;
-    cmdVelY = prevCmdY + dy;
-
-    // Update memory
-    prevCmdX = cmdVelX;
-    prevCmdY = cmdVelY;
-    // =====================================================
-
-    // Smoothing to avoid oscillations
-    static float prevX = 0, prevY = 0;  // 'static' ensures the value is remembered across loop iterations
-    cmdVelX = 0.7f * prevX + 0.3f * cmdVelX;  // 70% old value + 30% new value
-    cmdVelY = 0.7f * prevY + 0.3f * cmdVelY;  // 70% old value + 30% new value
-    prevX = cmdVelX;
-    prevY = cmdVelY;
-
-    setVelocitySetpoint(&setpoint,cmdVelX,cmdVelY,cmdHeight,cmdYawRateDeg);
-    commanderSetSetpoint(&setpoint,3);
+    setVelocitySetpoint(&setpoint, cmdVelX, cmdVelY, cmdHeight, cmdYawRateDeg);
+    commanderSetSetpoint(&setpoint, COMMANDER_PRIORITY_EXTRX);
   }
 }
 
-// ===================== Params =====================
-
 PARAM_GROUP_START(app)
-PARAM_ADD(PARAM_UINT8,active,&appActive)
-PARAM_ADD(PARAM_UINT8,human,&humanDetected)
-PARAM_ADD(PARAM_INT8,humanDir,&humanDir)
-PARAM_ADD(PARAM_FLOAT,humanDist,&humanStandOff)
-PARAM_ADD(PARAM_UINT8,goLeft,&goLeft)
-PARAM_ADD(PARAM_FLOAT,distanceWall,&distanceToWall)
-PARAM_ADD(PARAM_FLOAT,maxSpeed,&maxForwardSpeed)
+PARAM_ADD(PARAM_UINT8, active, &appActive)
+PARAM_ADD(PARAM_UINT8, goLeft, &goLeft)
+PARAM_ADD(PARAM_FLOAT, distanceWall, &distanceToWall)
+PARAM_ADD(PARAM_FLOAT, maxSpeed, &maxForwardSpeed)
 PARAM_GROUP_STOP(app)
 
-// ===================== Logs =====================
-
 LOG_GROUP_START(app)
-LOG_ADD(LOG_FLOAT,cmdVelX,&cmdVelX)
-LOG_ADD(LOG_FLOAT,cmdVelY,&cmdVelY)
-LOG_ADD(LOG_UINT8,missionState,&missionState)
-LOG_ADD(LOG_UINT8,humanDetected,&humanDetected)
+LOG_ADD(LOG_FLOAT, cmdVelX, &cmdVelX)
+LOG_ADD(LOG_FLOAT, cmdVelY, &cmdVelY)
+LOG_ADD(LOG_FLOAT, cmdYawDeg, &cmdYawRateDeg)
+LOG_ADD(LOG_UINT8, stateInner, &stateInnerLoop)
+LOG_ADD(LOG_UINT8, stateOuter, &stateOuterLoop)
+LOG_ADD(LOG_UINT8, mission, &missionState)
+LOG_ADD(LOG_UINT8, human, &humanDetected)
+LOG_ADD(LOG_UINT8, humanConf, &humanConfidence)
+LOG_ADD(LOG_INT8, humanDir, &humanDir)
+LOG_ADD(LOG_UINT8, humanFresh, &humanPacketFresh)
+LOG_ADD(LOG_UINT8, humanStable, &humanStable)
+LOG_ADD(LOG_FLOAT, humanHold, &humanHoldTimeS)
+LOG_ADD(LOG_UINT32, humanAgeMs, &humanAgeMs)
+LOG_ADD(LOG_INT16, humanMax, &humanMaxTempX100)
+LOG_ADD(LOG_INT16, humanTherm, &humanThermistorX100)
 LOG_GROUP_STOP(app)
-

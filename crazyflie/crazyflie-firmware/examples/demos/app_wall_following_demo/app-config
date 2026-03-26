@@ -1,3 +1,5 @@
 CONFIG_APP_ENABLE=y
 CONFIG_APP_PRIORITY=1
 CONFIG_APP_STACKSIZE=350
+# Reserve UART2 for the ESP32 bridge; CPX on UART2 conflicts with it.
+# CONFIG_ENABLE_CPX_ON_UART2 is not set

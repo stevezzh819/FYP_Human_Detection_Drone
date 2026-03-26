@@ -3,7 +3,6 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
-#include <limits.h>
 #include <stdint.h>
 
 #include "freertos/FreeRTOS.h"
@@ -35,19 +34,13 @@
 #define CF_UART_PORT                 UART_NUM_1
 #define CF_UART_TX_PIN               GPIO_NUM_20
 #define CF_UART_RX_PIN               GPIO_NUM_21
-#define CF_UART_BAUDRATE             115200
+#define CF_UART_BAUDRATE             57600
 
 #define STATUS_LED_PIN               GPIO_NUM_7
 #define STATUS_LED_BLINK_MS          200U
 
 #define MAIN_LOOP_PERIOD_MS          100U
 #define UART_RX_STATS_PERIOD_MS      1000U
-#define INITIAL_TAKEOFF_DELAY_MS     3000U
-#define TAKEOFF_HEIGHT_CM            30U
-#define TAKEOFF_DURATION_MS          2000U
-#define LAND_DURATION_MS             2000U
-#define FLIGHT_CMD_GAP_MS            1000U
-#define LAND_RETRY_LIMIT             3U
 
 typedef struct {
     int size;
@@ -55,6 +48,7 @@ typedef struct {
     int max_r;
     int min_c;
     int max_c;
+    float c_sum;
     float t_sum;
     float t_max;
     float t_sq_sum;
@@ -67,6 +61,7 @@ typedef struct {
     float avg_temp_c;
     float ambient_c;
     int blob_size;
+    int8_t human_dir;
 } inference_result_t;
 
 static const char *TAG = "cf_esp_app";
@@ -199,12 +194,15 @@ static blob_stats_t largest_blob_stats(const bool *mask, const float *pix)
 
     for (int r = 0; r < 8; r++) {
         for (int c = 0; c < 8; c++) {
-            int k = (r * 8) + c;
+            const int k = (r * 8) + c;
             if (!mask[k] || vis[k]) {
                 continue;
             }
 
-            int qR[64], qC[64], qh = 0, qt = 0;
+            int qR[64];
+            int qC[64];
+            int qh = 0;
+            int qt = 0;
             blob_stats_t cur;
             memset(&cur, 0, sizeof(cur));
             cur.min_r = cur.min_c = 99;
@@ -217,9 +215,10 @@ static blob_stats_t largest_blob_stats(const bool *mask, const float *pix)
             qt++;
 
             while (qh < qt) {
-                int rr = qR[qh], cc = qC[qh];
+                const int rr = qR[qh];
+                const int cc = qC[qh];
                 qh++;
-                int idx = (rr * 8) + cc;
+                const int idx = (rr * 8) + cc;
 
                 cur.size++;
                 if (rr < cur.min_r) cur.min_r = rr;
@@ -227,17 +226,19 @@ static blob_stats_t largest_blob_stats(const bool *mask, const float *pix)
                 if (cc < cur.min_c) cur.min_c = cc;
                 if (cc > cur.max_c) cur.max_c = cc;
 
-                float t = pix[idx];
+                const float t = pix[idx];
+                cur.c_sum += (float)cc;
                 cur.t_sum += t;
                 cur.t_sq_sum += t * t;
                 if (t > cur.t_max) cur.t_max = t;
 
                 for (int i = 0; i < 8; i++) {
-                    int nr = rr + dr[i], nc = cc + dc[i];
+                    const int nr = rr + dr[i];
+                    const int nc = cc + dc[i];
                     if (nr < 0 || nr >= 8 || nc < 0 || nc >= 8) {
                         continue;
                     }
-                    int nk = (nr * 8) + nc;
+                    const int nk = (nr * 8) + nc;
                     if (mask[nk] && !vis[nk]) {
                         vis[nk] = true;
                         qR[qt] = nr;
@@ -267,8 +268,8 @@ static bool is_human_1m(const blob_stats_t *b, float amb)
     if (var < 0) {
         var = 0;
     }
-    float std = sqrtf(var);
-    float tmax = b->t_max;
+    const float std = sqrtf(var);
+    const float tmax = b->t_max;
 
     if (tmax < amb + 3.0f) return false;
     if (mean < amb + 2.0f) return false;
@@ -281,8 +282,8 @@ static bool is_human_1m(const blob_stats_t *b, float amb)
 
 static int cmp_float(const void *a, const void *b)
 {
-    float fa = *(const float *)a;
-    float fb = *(const float *)b;
+    const float fa = *(const float *)a;
+    const float fb = *(const float *)b;
     return (fa > fb) - (fa < fb);
 }
 
@@ -294,7 +295,9 @@ static float ambient_lowk(const float pix[64], int k)
     if (k < 1) k = 1;
     if (k > 64) k = 64;
     float s = 0.0f;
-    for (int i = 0; i < k; i++) s += tmp[i];
+    for (int i = 0; i < k; i++) {
+        s += tmp[i];
+    }
     return s / (float)k;
 }
 
@@ -323,8 +326,8 @@ static inference_result_t run_human_inference(const float pix[64], float bg[64])
         sum_temp += pix[i];
     }
 
-    float amb_th = amg_read_thermistor();
-    float amb_low = ambient_lowk(pix, 10);
+    const float amb_th = amg_read_thermistor();
+    const float amb_low = ambient_lowk(pix, 10);
     int above_th = 0;
     for (int i = 0; i < 64; i++) {
         if (pix[i] > amb_th) {
@@ -340,16 +343,16 @@ static inference_result_t run_human_inference(const float pix[64], float bg[64])
     }
 
     for (int i = 0; i < 64; i++) {
-        bool hot_vs_amb = pix[i] >= amb + delta_abs;
-        bool hot_vs_bg = pix[i] >= bg[i] + delta_rel;
+        const bool hot_vs_amb = pix[i] >= amb + delta_abs;
+        const bool hot_vs_bg = pix[i] >= bg[i] + delta_rel;
         mask[i] = (hot_vs_amb || hot_vs_bg);
         if (!mask[i]) {
             bg[i] = (1.0f - alpha) * bg[i] + alpha * pix[i];
         }
     }
 
-    blob_stats_t b = largest_blob_stats(mask, pix);
-    bool det = (b.size >= 4);
+    const blob_stats_t b = largest_blob_stats(mask, pix);
+    const bool det = (b.size >= 4);
     if (det) {
         hits++;
         misses = 0;
@@ -360,7 +363,7 @@ static inference_result_t run_human_inference(const float pix[64], float bg[64])
     if (!occupied && hits >= 2) occupied = true;
     if (occupied && misses >= 6) occupied = false;
 
-    bool human_now = is_human_1m(&b, amb);
+    const bool human_now = is_human_1m(&b, amb);
     if (human_now) {
         h_on++;
         h_off = 0;
@@ -376,9 +379,10 @@ static inference_result_t run_human_inference(const float pix[64], float bg[64])
     result.avg_temp_c = sum_temp / 64.0f;
     result.ambient_c = amb;
     result.blob_size = b.size;
+    result.human_dir = 0;
 
     if (b.size > 0) {
-        float blob_mean = b.t_sum / (float)b.size;
+        const float blob_mean = b.t_sum / (float)b.size;
         float score = ((b.t_max - amb) * 18.0f) + ((blob_mean - amb) * 12.0f);
         if (b.size >= 6) {
             score += 10.0f;
@@ -386,30 +390,18 @@ static inference_result_t run_human_inference(const float pix[64], float bg[64])
         if (score < 0.0f) score = 0.0f;
         if (score > 100.0f) score = 100.0f;
         result.confidence = (uint8_t)lrintf(score);
+
+        if (human_present) {
+            const float center_c = b.c_sum / (float)b.size;
+            if (center_c <= 2.5f) {
+                result.human_dir = -1;
+            } else if (center_c >= 4.5f) {
+                result.human_dir = 1;
+            }
+        }
     }
 
     return result;
-}
-
-static void send_flight_command(uint8_t command_id, uint16_t height_cm, uint16_t duration_ms)
-{
-    uint8_t payload[5] = {0};
-    payload[0] = command_id;
-    payload[1] = (uint8_t)(height_cm & 0xFFU);
-    payload[2] = (uint8_t)((height_cm >> 8U) & 0xFFU);
-    payload[3] = (uint8_t)(duration_ms & 0xFFU);
-    payload[4] = (uint8_t)((duration_ms >> 8U) & 0xFFU);
-
-    const esp_err_t err = uart_cf_send_packet(UART_CF_TYPE_COMMAND, payload, sizeof(payload));
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG,
-                 "UART FLIGHT CMD TX -> Crazyflie: cmd=0x%02X height=%ucm duration=%ums",
-                 command_id,
-                 (unsigned)height_cm,
-                 (unsigned)duration_ms);
-    } else {
-        ESP_LOGW(TAG, "UART FLIGHT CMD TX failed (cmd=0x%02X): %s", command_id, esp_err_to_name(err));
-    }
 }
 
 static void send_detection_to_crazyflie(const inference_result_t *result, float thermistor_c)
@@ -422,17 +414,18 @@ static void send_detection_to_crazyflie(const inference_result_t *result, float 
     const int16_t max_temp_x100 = (int16_t)lrintf(result->max_temp_c * 100.0f);
     const int16_t thermistor_x100 = (int16_t)lrintf(thermistor_c * 100.0f);
 
-    uint8_t payload[10] = {0};
+    uint8_t payload[11] = {0};
     payload[0] = result->human_detected ? 1U : 0U;
     payload[1] = result->confidence;
-    payload[2] = (uint8_t)(max_temp_x100 & 0xFF);
-    payload[3] = (uint8_t)((max_temp_x100 >> 8) & 0xFF);
-    payload[4] = (uint8_t)(thermistor_x100 & 0xFF);
-    payload[5] = (uint8_t)((thermistor_x100 >> 8) & 0xFF);
-    payload[6] = (uint8_t)(timestamp_ms & 0xFF);
-    payload[7] = (uint8_t)((timestamp_ms >> 8) & 0xFF);
-    payload[8] = (uint8_t)((timestamp_ms >> 16) & 0xFF);
-    payload[9] = (uint8_t)((timestamp_ms >> 24) & 0xFF);
+    payload[2] = (uint8_t)result->human_dir;
+    payload[3] = (uint8_t)(max_temp_x100 & 0xFF);
+    payload[4] = (uint8_t)((max_temp_x100 >> 8) & 0xFF);
+    payload[5] = (uint8_t)(thermistor_x100 & 0xFF);
+    payload[6] = (uint8_t)((thermistor_x100 >> 8) & 0xFF);
+    payload[7] = (uint8_t)(timestamp_ms & 0xFF);
+    payload[8] = (uint8_t)((timestamp_ms >> 8) & 0xFF);
+    payload[9] = (uint8_t)((timestamp_ms >> 16) & 0xFF);
+    payload[10] = (uint8_t)((timestamp_ms >> 24) & 0xFF);
 
     const esp_err_t err = uart_cf_send_packet(UART_CF_TYPE_HUMAN_DETECT, payload, sizeof(payload));
     if (err != ESP_OK) {
@@ -474,18 +467,13 @@ void app_main(void)
 
     ESP_ERROR_CHECK(i2c_read(REG_PXL, raw, sizeof(raw)));
     for (int i = 0, p = 0; i < 128; i += 2, ++p) {
-        uint16_t v = (uint16_t)raw[i] | ((uint16_t)raw[i + 1] << 8);
+        const uint16_t v = (uint16_t)raw[i] | ((uint16_t)raw[i + 1] << 8);
         bg[p] = amg_pix_to_c(v);
     }
 
     int64_t last_log_ms = 0;
     int64_t last_uart_rx_stats_ms = 0;
-    int64_t boot_ms = -1;
-    int64_t last_flight_cmd_ms = LLONG_MIN / 4;
-    bool crazyflie_flying = false;
-    bool initial_takeoff_sent = false;
     bool last_human_detected = false;
-    uint8_t land_retry_count = 0U;
 
     while (true) {
         uart_cf_packet_t rx_packet = {0};
@@ -494,9 +482,6 @@ void app_main(void)
         }
 
         const int64_t now_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if (boot_ms < 0) {
-            boot_ms = now_ms;
-        }
 
         if ((now_ms - last_uart_rx_stats_ms) >= UART_RX_STATS_PERIOD_MS) {
             ESP_LOGI(TAG,
@@ -504,13 +489,6 @@ void app_main(void)
                      (unsigned long)uart_cf_get_rx_byte_count(),
                      (unsigned long)uart_cf_get_rx_packet_count());
             last_uart_rx_stats_ms = now_ms;
-        }
-
-        if (!initial_takeoff_sent && ((now_ms - boot_ms) >= INITIAL_TAKEOFF_DELAY_MS)) {
-            send_flight_command(UART_CF_CMD_TAKEOFF, TAKEOFF_HEIGHT_CM, TAKEOFF_DURATION_MS);
-            initial_takeoff_sent = true;
-            crazyflie_flying = true;
-            last_flight_cmd_ms = now_ms;
         }
 
         if (i2c_read(REG_PXL, raw, sizeof(raw)) != ESP_OK) {
@@ -521,11 +499,11 @@ void app_main(void)
         }
 
         for (int i = 0, p = 0; i < 128; i += 2, ++p) {
-            uint16_t v = (uint16_t)raw[i] | ((uint16_t)raw[i + 1] << 8);
+            const uint16_t v = (uint16_t)raw[i] | ((uint16_t)raw[i + 1] << 8);
             pix[p] = amg_pix_to_c(v);
         }
 
-        float thermistor_c = amg_read_thermistor();
+        const float thermistor_c = amg_read_thermistor();
         const inference_result_t result = run_human_inference(pix, bg);
 
         send_detection_to_crazyflie(&result, thermistor_c);
@@ -533,54 +511,28 @@ void app_main(void)
 
         if (result.human_detected != last_human_detected) {
             ESP_LOGI(TAG,
-                     "Human detect transition -> %u (conf=%u blob=%d)",
+                     "Human detect transition -> %u (conf=%u dir=%d blob=%d)",
                      result.human_detected ? 1U : 0U,
                      result.confidence,
+                     result.human_dir,
                      result.blob_size);
             last_human_detected = result.human_detected;
-            if (result.human_detected) {
-                land_retry_count = 0U;
-            }
-        }
-
-        if (initial_takeoff_sent && ((now_ms - last_flight_cmd_ms) >= FLIGHT_CMD_GAP_MS)) {
-            if (result.human_detected) {
-                if (crazyflie_flying || (land_retry_count < LAND_RETRY_LIMIT)) {
-                    send_flight_command(UART_CF_CMD_LAND, 0U, LAND_DURATION_MS);
-                    crazyflie_flying = false;
-                    last_flight_cmd_ms = now_ms;
-                    if (land_retry_count < 0xFFU) {
-                        land_retry_count++;
-                    }
-                    ESP_LOGI(TAG, "LAND attempt %u while human detected", (unsigned)land_retry_count);
-                }
-            } else {
-                land_retry_count = 0U;
-                if (!crazyflie_flying) {
-                    send_flight_command(UART_CF_CMD_TAKEOFF, TAKEOFF_HEIGHT_CM, TAKEOFF_DURATION_MS);
-                    crazyflie_flying = true;
-                    last_flight_cmd_ms = now_ms;
-                    ESP_LOGI(TAG, "TAKEOFF command sent because no human is detected");
-                }
-            }
         }
 
         if ((now_ms - last_log_ms) >= 1000) {
             ESP_LOGI(TAG,
-                     "Human=%u conf=%u%% blob=%d max=%.2fC avg=%.2fC amb=%.2fC therm=%.2fC flying=%u land_retry=%u",
+                     "Human=%u conf=%u%% dir=%d blob=%d max=%.2fC avg=%.2fC amb=%.2fC therm=%.2fC",
                      result.human_detected ? 1U : 0U,
                      result.confidence,
+                     result.human_dir,
                      result.blob_size,
                      result.max_temp_c,
                      result.avg_temp_c,
                      result.ambient_c,
-                     thermistor_c,
-                     crazyflie_flying ? 1U : 0U,
-                     (unsigned)land_retry_count);
+                     thermistor_c);
             last_log_ms = now_ms;
         }
 
         vTaskDelay(pdMS_TO_TICKS(MAIN_LOOP_PERIOD_MS));
     }
 }
-
