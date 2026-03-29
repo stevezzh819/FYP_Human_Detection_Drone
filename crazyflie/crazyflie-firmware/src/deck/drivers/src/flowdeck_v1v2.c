@@ -44,6 +44,8 @@
 #define AVERAGE_HISTORY_LENGTH 4
 #define OULIER_LIMIT 100
 #define LP_CONSTANT 0.8f
+#define FLOWDECK_PMW_INIT_DELAY_MS 50
+#define FLOWDECK_PMW_INIT_RETRIES 5
 // #define USE_LP_FILTER
 // #define USE_MA_SMOOTHING
 
@@ -163,6 +165,25 @@ static void flowdeckTask(void *param)
   }
 }
 
+static bool startFlowdeckTaskIfPmwReady(void)
+{
+  for (int attempt = 0; attempt < FLOWDECK_PMW_INIT_RETRIES; attempt++) {
+    vTaskDelay(M2T(FLOWDECK_PMW_INIT_DELAY_MS));
+
+    if (pmw3901Init(NCS_PIN))
+    {
+      xTaskCreate(flowdeckTask, FLOW_TASK_NAME, FLOW_TASK_STACKSIZE, NULL,
+                  FLOW_TASK_PRI, NULL);
+
+      return true;
+    }
+
+    DEBUG_PRINT("PMW3901 init retry %d/%d failed\n", attempt + 1, FLOWDECK_PMW_INIT_RETRIES);
+  }
+
+  return false;
+}
+
 static void flowdeck1Init()
 {
   if (isInit1 || isInit2) {
@@ -173,11 +194,8 @@ static void flowdeck1Init()
   const DeckDriver *zRanger = deckFindDriverByName("bcZRanger");
   zRanger->init(NULL);
 
-  if (pmw3901Init(NCS_PIN))
+  if (startFlowdeckTaskIfPmwReady())
   {
-    xTaskCreate(flowdeckTask, FLOW_TASK_NAME, FLOW_TASK_STACKSIZE, NULL,
-                FLOW_TASK_PRI, NULL);
-
     isInit1 = true;
   }
 }
@@ -219,11 +237,8 @@ static void flowdeck2Init()
   const DeckDriver *zRanger = deckFindDriverByName("bcZRanger2");
   zRanger->init(NULL);
 
-  if (pmw3901Init(NCS_PIN))
+  if (startFlowdeckTaskIfPmwReady())
   {
-    xTaskCreate(flowdeckTask, FLOW_TASK_NAME, FLOW_TASK_STACKSIZE, NULL,
-                FLOW_TASK_PRI, NULL);
-
     isInit2 = true;
   }
 }

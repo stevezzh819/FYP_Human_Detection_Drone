@@ -84,7 +84,7 @@ fi
 
 if [ -z "$KCONFIG_CONFIG" ]; then
 	if [ "$OUTPUT" != . ]; then
-		KCONFIG_CONFIG=$(readlink -m -- "$OUTPUT/.config")
+		KCONFIG_CONFIG=$(realpath "$OUTPUT/.config")
 	else
 		KCONFIG_CONFIG=build/.config
 	fi
@@ -126,13 +126,14 @@ for MERGE_FILE in $MERGE_LIST ; do
 		elif [ "$WARNREDUN" = "true" ]; then
 			echo Value of $CFG is redundant by fragment $MERGE_FILE:
 		fi
-		sed -i "/$CFG[ =]/d" $TMP_FILE
+		sed "/$CFG[ =]/d" "$TMP_FILE" > "${TMP_FILE}.new"
+		mv "${TMP_FILE}.new" "$TMP_FILE"
 	done
 	cat $MERGE_FILE >> $TMP_FILE
 done
 
 if [ "$RUNMAKE" = "false" ]; then
-	cp -T -- "$TMP_FILE" "$KCONFIG_CONFIG"
+	cp "$TMP_FILE" "$KCONFIG_CONFIG"
 	echo "#"
 	echo "# merged configuration written to $KCONFIG_CONFIG (needs make)"
 	echo "#"

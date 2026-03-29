@@ -1,0 +1,70 @@
+Metadata-Version: 2.4
+Name: cfclient
+Version: 2025.12.1
+Summary: Crazyflie PC client
+Author-email: Bitcraze and contributors <contact@bitcraze.io>
+License: GPLv2+
+Project-URL: Homepage, https://www.bitcraze.io
+Project-URL: Documentation, https://www.bitcraze.io/documentation/repository/crazyflie-clients-python/master/
+Project-URL: Repository, https://github.com/bitcraze/crazyflie-clients-python
+Project-URL: Issues, https://github.com/bitcraze/crazyflie-clients-python/issues
+Keywords: quadcopter,crazyflie
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: License :: OSI Approved :: GNU General Public License v2 or later (GPLv2+)
+Classifier: Topic :: Scientific/Engineering
+Classifier: Topic :: Scientific/Engineering :: Visualization
+Classifier: Topic :: Software Development :: User Interfaces
+Classifier: Intended Audience :: End Users/Desktop
+Classifier: Intended Audience :: Science/Research
+Classifier: Intended Audience :: Education
+Classifier: Intended Audience :: Developers
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Operating System :: MacOS
+Classifier: Operating System :: Microsoft :: Windows
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE.txt
+Requires-Dist: cflib~=0.1.31
+Requires-Dist: setuptools
+Requires-Dist: appdirs~=1.4.0
+Requires-Dist: pyzmq~=26.0
+Requires-Dist: pyqtgraph~=0.13
+Requires-Dist: PyYAML~=6.0.1
+Requires-Dist: numpy~=2.2
+Requires-Dist: vispy~=0.15.2
+Requires-Dist: pyopengl~=3.1.7
+Requires-Dist: pyserial~=3.5
+Requires-Dist: PyQt6~=6.7.1
+Requires-Dist: PyQt6-sip~=13.8
+Requires-Dist: pysdl2~=0.9.14; platform_system == "Windows" or platform_system == "Darwin"
+Requires-Dist: pysdl2-dll==2.24.0; platform_system == "Windows" or platform_system == "Darwin"
+Provides-Extra: dev
+Requires-Dist: pre-commit; extra == "dev"
+Requires-Dist: cx_freeze==5.1.1; platform_system == "Windows" and extra == "dev"
+Requires-Dist: jinja2==2.10.3; platform_system == "Windows" and extra == "dev"
+Dynamic: license-file
+
+# Crazyflie PC client [![CI](https://github.com/bitcraze/crazyflie-clients-python/workflows/CI/badge.svg)](https://github.com/bitcraze/crazyflie-clients-python/actions?query=workflow%3ACI)
+
+This repository contains host applications for the Crazyflie, including the PC client (`cfclient`), headless client (`cfheadless`), firmware loader (`cfloader`), and ZMQ interface (`cfzmq`).
+These applications provide graphical and command-line interfaces for firmware flashing, flight control, parameter configuration, real-time data logging and visualization, and more.
+All applications are built on [`cflib`](https://github.com/bitcraze/crazyflie-lib-python).
+
+## Installation
+See the [installation instructions](docs/installation/install.md) in the GitHub docs folder.
+
+## Official Documentation
+
+Check out the [Bitcraze crazyflie-client-python documentation](https://www.bitcraze.io/documentation/repository/crazyflie-clients-python/master/) on our website.
+
+## Contribute
+Go to the [contribute page](https://www.bitcraze.io/contribute/) on our website to learn more.
+
+### Test code for contribution
+Run the automated build locally to test your code
+
+	python3 tools/build/build

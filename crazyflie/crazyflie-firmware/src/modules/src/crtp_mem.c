@@ -107,14 +107,9 @@ bool crtpMemTest(void) {
 static void memTask(void* param) {
 	crtpInitTaskQueue(CRTP_PORT_MEM);
 
-  // This should be synced with decks starting up, otherwise
-  // there might be late arrivals for the registration that will
-  // trigger assert.
-
-  systemWaitStart();
-
-  // Do not allow registration of new handlers after this point as clients now can start
-  // to query for available memories
+  // Memory handlers are registered before crtpMemInit() is called from systemTask().
+  // Starting the MEM CRTP task here keeps host-side connections working even if a self-test
+  // later prevents systemStart() from being released.
   memBlockHandlerRegistration();
 
 	while(1) {
