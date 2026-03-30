@@ -8,6 +8,15 @@
 
 # Environment/config artifacts
 *.env
+.venv/
+.venv*/
+venv/
+env/
+ENV/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
 # Local docs/media
 Documents/
