@@ -470,7 +470,8 @@ void appMain()
 
     int wallDirection = goLeft ? 1 : -1;
 
-    if (vbat < BATTERY_CUTOFF && vbat > 0.1f && stateOuterLoop == unlocked)
+    if (vbat < BATTERY_CUTOFF && vbat > 0.1f && stateOuterLoop == unlocked
+        && missionState != mission_land && missionState != mission_transition)
     {
       missionTransition(mission_land, timeNow);
       // stateOuterLoop = stopping;
