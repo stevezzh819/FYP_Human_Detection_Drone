@@ -742,31 +742,31 @@ void appMain()
 
     /* =================================================================== */
 
-    // ================= ACCELERATION LIMIT =================
-    static float prevCmdX = 0.0f;
-    static float prevCmdY = 0.0f;
+    // // ================= ACCELERATION LIMIT =================
+    // static float prevCmdX = 0.0f;
+    // static float prevCmdY = 0.0f;
 
-    float maxDelta = 0.05f;  // tune this (0.03–0.07 range)
+    // float maxDelta = 0.05f;  // tune this (0.03–0.07 range)
 
-    // Compute change
-    float dx = cmdVelX - prevCmdX;
-    float dy = cmdVelY - prevCmdY;
+    // // Compute change
+    // float dx = cmdVelX - prevCmdX;
+    // float dy = cmdVelY - prevCmdY;
 
-    // Clamp change
-    if (dx > maxDelta) dx = maxDelta;
-    if (dx < -maxDelta) dx = -maxDelta;
+    // // Clamp change
+    // if (dx > maxDelta) dx = maxDelta;
+    // if (dx < -maxDelta) dx = -maxDelta;
 
-    if (dy > maxDelta) dy = maxDelta;
-    if (dy < -maxDelta) dy = -maxDelta;
+    // if (dy > maxDelta) dy = maxDelta;
+    // if (dy < -maxDelta) dy = -maxDelta;
 
-    // Apply limited change
-    cmdVelX = prevCmdX + dx;
-    cmdVelY = prevCmdY + dy;
+    // // Apply limited change
+    // cmdVelX = prevCmdX + dx;
+    // cmdVelY = prevCmdY + dy;
 
-    // Update memory
-    prevCmdX = cmdVelX;
-    prevCmdY = cmdVelY;
-    // =====================================================
+    // // Update memory
+    // prevCmdX = cmdVelX;
+    // prevCmdY = cmdVelY;
+    // // =====================================================
 
     // Smoothing to avoid oscillations
     static float prevX = 0, prevY = 0;  // 'static' ensures the value is remembered across loop iterations
