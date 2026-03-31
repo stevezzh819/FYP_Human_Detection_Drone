@@ -636,6 +636,8 @@ void appMain()
           break;
         }
 
+        cmdYawRateDeg = 5.0 * humanDir;
+
         float t = timeNow - missionStateStart;
 
         if (t < 0.4f)
