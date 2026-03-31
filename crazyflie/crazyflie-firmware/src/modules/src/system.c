@@ -304,18 +304,9 @@ void systemTask(void *arg)
     selftestPassed = 0;
     if (systemTest())
     {
-      while(1)
-      {
-        ledseqRun(&seq_testFailed);
-        vTaskDelay(M2T(2000));
-        // System can be forced to start by setting the param to 1 from the cfclient
-        if (selftestPassed)
-        {
-	        DEBUG_PRINT("Start forced.\n");
-          systemStart();
-          break;
-        }
-      }
+      DEBUG_PRINT("Self test failed, continuing startup for telemetry/debug.\n");
+      ledseqRun(&seq_testFailed);
+      systemStart();
     }
     else
     {

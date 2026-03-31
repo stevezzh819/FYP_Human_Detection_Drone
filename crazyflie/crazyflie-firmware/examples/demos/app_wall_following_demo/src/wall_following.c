@@ -58,6 +58,7 @@ Modified by: Bock Kai Sheng, Hu Linxi, Zhang Zehua (NUS Electrical Engineering s
 #include "usec_time.h"
 
 #include "wallfollowing_multiranger_onboard.h"
+#include "esp_uart_bridge.h"
 
 #define DEBUG_MODULE "WALLFOLLOWING"
 
@@ -76,6 +77,8 @@ static const float TRANSITION_TIME = 0.35f;
 
 // Human detection parameter(s)
 static const uint32_t HUMAN_PACKET_STALE_TIMEOUT_MS = 300U;  // Defines how long (in milliseconds) before a received ESP32 packet is considered outdated.
+
+static const float HUMAN_CONFIRM_TIME = 3.0f;  // Param/Variable for Dashboard Reading
 
 static const float BATTERY_CUTOFF = 2.8f;
 
@@ -106,6 +109,10 @@ static int16_t humanMaxTempX100 = 0;
 static int16_t humanThermistorX100 = 0;
 // static float humanHoldTimeS = 0.0f;
 // static uint8_t humanStable = 0U;
+
+static float humanHoldTimeS = 0.0f;  // Param/Variable for Dashboard Reading
+static uint8_t humanStable = 0U;  // Param/Variable for Dashboard Reading
+static float humanDetectStart = -1.0f;  // Param/Variable for Dashboard Reading
 float humanStandOff = 1.0f;  // Desired distance that the drone should keep from a detected human (should NOT be too close for safety)
 
 // ===================== Command variables =====================
@@ -114,17 +121,21 @@ float cmdVelX = 0.0f;
 float cmdVelY = 0.0f;
 float cmdYawRateDeg = 0.0f;
 
+static uint8_t dashboardMissionState = 0U;  // Param/Variable for Dashboard Reading
+
 // ===================== ESP32 Communication =====================
 
+// ---------- Bridging ---------
+
 // EspUartLogIds struct
-typedef struct {
-  logVarId_t detected;
-  logVarId_t confidence;
-  logVarId_t direction;
-  logVarId_t maxTemp;
-  logVarId_t therm;
-  logVarId_t rxLocalMs;
-} EspUartLogIds;
+// typedef struct {
+//   logVarId_t detected;
+//   logVarId_t confidence;
+//   logVarId_t direction;
+//   logVarId_t maxTemp;
+//   logVarId_t therm;
+//   logVarId_t rxLocalMs;
+// } EspUartLogIds;
 
 // ===================== Outer loop =====================
 
@@ -197,24 +208,47 @@ static void resetWallFollower()
 
 // Checks if all the required ESP32 log IDs have been successfully registered in the system.
 // Prevents the drone from reading garbage memory before the ESP32 bridge is fully initialised.
-static bool espUartLogIdsReady(const EspUartLogIds *ids)
+
+// static bool espUartLogIdsReady(const EspUartLogIds *ids)
+// {
+//   return logVarIdIsValid(ids->detected) &&
+//          logVarIdIsValid(ids->confidence) &&
+//          logVarIdIsValid(ids->direction) &&
+//          logVarIdIsValid(ids->maxTemp) &&
+//          logVarIdIsValid(ids->therm) &&
+//          logVarIdIsValid(ids->rxLocalMs);
+// }
+
+static uint8_t getDashboardMissionState(MissionState state)
 {
-  return logVarIdIsValid(ids->detected) &&
-         logVarIdIsValid(ids->confidence) &&
-         logVarIdIsValid(ids->direction) &&
-         logVarIdIsValid(ids->maxTemp) &&
-         logVarIdIsValid(ids->therm) &&
-         logVarIdIsValid(ids->rxLocalMs);
+  switch(state)
+  {
+  case mission_reacquire_wall:
+    return 0U;
+  case mission_wallfollow:
+    return 1U;
+  case mission_scan:
+    return 2U;
+  case mission_approach:
+    return 3U;
+  case mission_bob:
+    return 3U;
+  case mission_land:
+    return 4U;
+  case mission_transition:
+    return 5U;
+  }
+
+  return 0U;
 }
 
 // Called every loop tick ('while' loop)
 // Reads the ESP32 log variables, calculates how old the data is ( humanAgeMs ),
 // checks if it exceeds the 300 ms staleness window, and updates the global perception variables accordingly.
-static void updateHumanPerception(const EspUartLogIds *ids, uint32_t nowMs)
+
+static void updateHumanPerception(uint32_t nowMs)
 {
-  if (!espUartLogIdsReady(ids)) {
-    return;
-  }
+  espUartHumanDetection_t sample = {0};
 
   humanDetected = 0U;
   humanConfidence = 0U;
@@ -223,26 +257,43 @@ static void updateHumanPerception(const EspUartLogIds *ids, uint32_t nowMs)
   humanAgeMs = 0U;
   humanMaxTempX100 = 0;
   humanThermistorX100 = 0;
+  humanHoldTimeS = 0.0f;
+  humanStable = 0U;
 
-  humanMaxTempX100 = (int16_t)logGetInt(ids->maxTemp);
-  humanThermistorX100 = (int16_t)logGetInt(ids->therm);
-
-  const uint32_t rxLocalMs = logGetUint(ids->rxLocalMs);
-  if (rxLocalMs == 0U) {
+  if (!espUartBridgeGetLatestHumanDetectionSample(&sample)) {
+    humanDetectStart = -1.0f;
     return;
   }
 
-  humanAgeMs = nowMs - rxLocalMs;
+  humanMaxTempX100 = sample.maxTempX100;
+  humanThermistorX100 = sample.thermistorX100;
+
+  if (sample.rxLocalTimeMs == 0U) {
+    humanDetectStart = -1.0f;
+    return;
+  }
+
+  humanAgeMs = nowMs - sample.rxLocalTimeMs;
 
   if (humanAgeMs > HUMAN_PACKET_STALE_TIMEOUT_MS) {
+    humanDetectStart = -1.0f;
     return;
   }
 
   humanPacketFresh = 1U;
-  humanConfidence = (uint8_t)logGetUint(ids->confidence);
-  humanDir = (int8_t)logGetInt(ids->direction);
-  if (logGetUint(ids->detected) != 0U) {
+  humanConfidence = sample.confidence;
+  humanDir = sample.direction;
+  if (sample.detected) {
     humanDetected = 1U;
+    if (humanDetectStart < 0.0f) {
+      humanDetectStart = (float)nowMs / 1000.0f;
+    }
+    humanHoldTimeS = ((float)nowMs / 1000.0f) - humanDetectStart;
+    if (humanHoldTimeS >= HUMAN_CONFIRM_TIME) {
+      humanStable = 1U;
+    }
+  } else {
+    humanDetectStart = -1.0f;
   }
 }
 
@@ -264,15 +315,14 @@ void appMain()
 
   logVarId_t idVbat = logGetVarId("pm","vbat");
 
-  // Initialise the new ESP32 log IDs & populate each field using logGetVarId("espUart", "...")
-  EspUartLogIds espUartIds = {
-    .detected = logGetVarId("espUart", "detected"),
-    .confidence = logGetVarId("espUart", "confidence"),
-    .direction = logGetVarId("espUart", "direction"),
-    .maxTemp = logGetVarId("espUart", "maxTemp"),
-    .therm = logGetVarId("espUart", "therm"),
-    .rxLocalMs = logGetVarId("espUart", "rxLocalMs"),
-  };
+  // EspUartLogIds espUartIds = {
+  //   .detected = logGetVarId("espUart", "detected"),
+  //   .confidence = logGetVarId("espUart", "confidence"),
+  //   .direction = logGetVarId("espUart", "direction"),
+  //   .maxTemp = logGetVarId("espUart", "maxTemp"),
+  //   .therm = logGetVarId("espUart", "therm"),
+  //   .rxLocalMs = logGetVarId("espUart", "rxLocalMs"),
+  // };
 
   // Getting Param IDs of the deck driver initialization
   paramVarId_t idPositioningDeck = paramGetVarId("deck","bcFlow2");
@@ -299,7 +349,7 @@ void appMain()
     float heightEstimate = logGetFloat(idHeight);
     
     const uint32_t nowMs = T2M(xTaskGetTickCount());
-    updateHumanPerception(&espUartIds, nowMs);
+    updateHumanPerception(nowMs);
 
     // Battery check
     float vbat = logGetFloat(idVbat);
@@ -364,6 +414,9 @@ void appMain()
 
 
     // -------- DISARM MOTORS IF NOT UNLOCKED --------
+
+    dashboardMissionState = (stateOuterLoop == unlocked) ? getDashboardMissionState(missionState) : 0U;  // Param/Variable for Dashboard Reading
+
     if(stateOuterLoop != unlocked)
     {
       memset(&setpoint,0,sizeof(setpoint));
@@ -723,6 +776,8 @@ void appMain()
     // Clamp velocity
     cmdVelX = MAX(MIN(cmdVelX, VEL_CLAMP), -VEL_CLAMP);
     cmdVelY = MAX(MIN(cmdVelY, VEL_CLAMP), -VEL_CLAMP);
+
+    dashboardMissionState = getDashboardMissionState(missionState);  // Param/Variable for Dashboard Reading
     
     setVelocitySetpoint(&setpoint,cmdVelX,cmdVelY,cmdHeight,cmdYawRateDeg);
     commanderSetSetpoint(&setpoint,3);
@@ -746,11 +801,16 @@ LOG_ADD(LOG_FLOAT,cmdVelY,&cmdVelY)
 LOG_ADD(LOG_FLOAT,cmdYawDeg, &cmdYawRateDeg)
 LOG_ADD(LOG_UINT8,stateInnerLoop, &stateInnerLoop)
 LOG_ADD(LOG_UINT8,stateOuterLoop, &stateOuterLoop)
+LOG_ADD(LOG_UINT8,stateOuter, &stateOuterLoop)  // Param/Variable for Dashboard Reading
 LOG_ADD(LOG_UINT8,missionState,&missionState)
+LOG_ADD(LOG_UINT8,mission,&dashboardMissionState)  // Param/Variable for Dashboard Reading
 LOG_ADD(LOG_UINT8,humanDetected,&humanDetected)
+LOG_ADD(LOG_UINT8,human,&humanDetected)  // Param/Variable for Dashboard Reading
 LOG_ADD(LOG_UINT8,humanConf,&humanConfidence)
 LOG_ADD(LOG_INT8,humanDir,&humanDir)
 LOG_ADD(LOG_UINT8,humanFresh,&humanPacketFresh)
+LOG_ADD(LOG_UINT8,humanStable,&humanStable)  // Param/Variable for Dashboard Reading
+LOG_ADD(LOG_FLOAT,humanHold,&humanHoldTimeS)  // Param/Variable for Dashboard Reading
 LOG_ADD(LOG_UINT32,humanAgeMs,&humanAgeMs)
 LOG_ADD(LOG_INT16,humanMax,&humanMaxTempX100)
 LOG_ADD(LOG_INT16,humanTherm,&humanThermistorX100)

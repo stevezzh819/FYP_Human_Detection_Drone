@@ -22,7 +22,7 @@ SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from radio_wall_follow_mission import discover_uri
+from radio_wall_follow_mission import check_crazyradio_access, discover_uri
 
 
 OUTER_NAMES = {
@@ -233,12 +233,18 @@ class RadioSession(threading.Thread):
         self.event_queue = event_queue
         self.command_queue: "queue.Queue[tuple[str, Optional[int]]]" = queue.Queue()
         self.stop_event = threading.Event()
+        self.cf: Optional[Crazyflie] = None
 
     def request_active(self, active: bool) -> None:
         self.command_queue.put(("set_active", 1 if active else 0))
 
     def shutdown(self) -> None:
         self.stop_event.set()
+        if self.cf is not None:
+            try:
+                self.cf.close_link()
+            except Exception:
+                pass
         self.command_queue.put(("stop", None))
 
     def _emit(self, event_type: str, **payload: object) -> None:
@@ -255,6 +261,7 @@ class RadioSession(threading.Thread):
             return
 
         cf = Crazyflie(rw_cache=self.cache_dir)
+        self.cf = cf
         logconfs: list[LogConfig] = []
         line_buffer: list[str] = []
 
@@ -411,18 +418,61 @@ class RadioSession(threading.Thread):
                 except Exception:
                     pass
 
+            self.cf = None
             self._emit("disconnected")
 
 
+class ScanSession(threading.Thread):
+    def __init__(self, event_queue: "queue.Queue[tuple[str, Dict[str, object]]]") -> None:
+        super().__init__(name="cf-scan-session", daemon=True)
+        self.event_queue = event_queue
+
+    def _emit(self, event_type: str, **payload: object) -> None:
+        self.event_queue.put((event_type, payload))
+
+    def run(self) -> None:
+        cflib.crtp.init_drivers()
+
+        try:
+            links = cflib.crtp.scan_interfaces()
+        except Exception as exc:
+            ok, radio_message = check_crazyradio_access()
+            if not ok:
+                self._emit("status", level="error", message=radio_message)
+            else:
+                self._emit("status", level="error", message=f"Failed to scan Crazyflie interfaces: {exc}")
+            self._emit("scan_result", interfaces=[], selected_uri=None)
+            return
+
+        interfaces = [uri for uri, _ in links]
+        selected_uri = None
+        for uri in interfaces:
+            if uri.startswith("radio://"):
+                selected_uri = uri
+                break
+        if selected_uri is None and interfaces:
+            selected_uri = interfaces[0]
+
+        self._emit("scan_result", interfaces=interfaces, selected_uri=selected_uri)
+
+
 class DashboardApp:
+    STATE_DISCONNECTED = "disconnected"
+    STATE_CONNECTING = "connecting"
+    STATE_CONNECTED = "connected"
+    STATE_SCANNING = "scanning"
+
     def __init__(self, root: tk.Tk, args: argparse.Namespace) -> None:
         self.root = root
         self.args = args
         self.event_queue: "queue.Queue[tuple[str, Dict[str, object]]]" = queue.Queue()
         self.worker: Optional[RadioSession] = None
+        self.scan_worker: Optional[ScanSession] = None
         self.connected = False
         self.closing = False
         self.pending_start = False
+        self.ui_state = self.STATE_DISCONNECTED
+        self.last_scan_uris: list[str] = []
         self.mission = MissionSnapshot()
         self.flow = FlowSnapshot()
         self.range = RangeSnapshot()
@@ -434,6 +484,7 @@ class DashboardApp:
         self._configure_root()
         self._build_layout()
         self._render_all()
+        self._set_ui_state(self.STATE_DISCONNECTED)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(60, self._pump_events)
@@ -508,6 +559,18 @@ class DashboardApp:
 
         buttons = tk.Frame(control_row, bg=PALETTE["app_bg"])
         buttons.pack(side="right")
+        self.scan_button = ColorButton(
+            buttons,
+            text="Scan",
+            command=self.scan,
+            bg="#2b2b2b",
+            fg="#ffffff",
+            active_bg="#1f1f1f",
+            active_fg="#ffffff",
+            width=10,
+            font=("Helvetica", 11, "bold"),
+        )
+        self.scan_button.grid(row=0, column=0, padx=4)
         self.connect_button = ColorButton(
             buttons,
             text="Connect",
@@ -516,10 +579,10 @@ class DashboardApp:
             fg="#ffffff",
             active_bg="#1a1a1a",
             active_fg="#ffffff",
-            width=12,
+            width=10,
             font=("Helvetica", 11, "bold"),
         )
-        self.connect_button.grid(row=0, column=0, padx=4)
+        self.connect_button.grid(row=0, column=1, padx=4)
         self.start_button = ColorButton(
             buttons,
             text="Start Mission",
@@ -532,7 +595,7 @@ class DashboardApp:
             font=("Helvetica", 11, "bold"),
         )
         self.start_button.set_state("disabled")
-        self.start_button.grid(row=0, column=1, padx=4)
+        self.start_button.grid(row=0, column=2, padx=4)
         self.stop_button = ColorButton(
             buttons,
             text="Stop Mission",
@@ -545,7 +608,7 @@ class DashboardApp:
             font=("Helvetica", 11, "bold"),
         )
         self.stop_button.set_state("disabled")
-        self.stop_button.grid(row=0, column=2, padx=4)
+        self.stop_button.grid(row=0, column=3, padx=4)
 
         status_row = tk.Frame(self.root, bg=PALETTE["app_bg"])
         status_row.pack(fill="x", padx=18, pady=(0, 12))
@@ -663,7 +726,30 @@ class DashboardApp:
         self.range_age_value.pack(anchor="w", pady=(4, 0))
 
     def connect(self) -> None:
-        self._begin_connection()
+        if self.ui_state == self.STATE_CONNECTED:
+            self._disconnect_session("Disconnect requested")
+        elif self.ui_state == self.STATE_CONNECTING:
+            self._disconnect_session("Cancelling connection")
+        elif self.ui_state == self.STATE_SCANNING:
+            return
+        else:
+            self._begin_connection()
+
+    def scan(self) -> None:
+        if self.ui_state != self.STATE_DISCONNECTED:
+            return
+
+        if self.scan_worker and self.scan_worker.is_alive():
+            return
+
+        self.pending_start = False
+        self.connection_var.set("Scanning")
+        self.status_var.set("Scanning for nearby Crazyflies...")
+        self._append_console("Scanning for nearby Crazyflies")
+        self._set_ui_state(self.STATE_SCANNING)
+
+        self.scan_worker = ScanSession(self.event_queue)
+        self.scan_worker.start()
 
     def start_mission(self) -> None:
         if not self.worker or not self.connected:
@@ -710,9 +796,7 @@ class DashboardApp:
         connected_uri = str(payload.get("uri", ""))
         self.uri_var.set(connected_uri)
         self.connection_var.set(f"Connected: {connected_uri}")
-        self.connect_button.set_state("normal")
-        self.start_button.set_state("normal")
-        self.stop_button.set_state("normal")
+        self._set_ui_state(self.STATE_CONNECTED)
         self._append_console(f"Connected to {connected_uri}")
         if self.pending_start and self.worker:
             self.pending_start = False
@@ -723,12 +807,94 @@ class DashboardApp:
     def _handle_disconnected(self) -> None:
         self.connected = False
         self.connection_var.set("Disconnected")
-        self.connect_button.set_state("normal")
-        self.start_button.set_state("disabled")
-        self.stop_button.set_state("disabled")
+        self.worker = None
+        self._set_ui_state(self.STATE_DISCONNECTED)
         if not self.closing:
             self.status_var.set("Disconnected")
             self._append_console("Radio session stopped")
+
+    def _handle_scan_result(self, payload: Dict[str, object]) -> None:
+        interfaces = [str(uri) for uri in payload.get("interfaces", [])]
+        selected_uri = str(payload.get("selected_uri") or "")
+        self.scan_worker = None
+        self.last_scan_uris = interfaces
+
+        if interfaces:
+            if selected_uri:
+                self.uri_var.set(selected_uri)
+            self.connection_var.set(f"Found {len(interfaces)} interface(s)")
+            if selected_uri:
+                self.status_var.set(f"Scan complete. Selected {selected_uri}")
+            else:
+                self.status_var.set("Scan complete")
+            self._append_console(f"Scan found: {', '.join(interfaces)}")
+        else:
+            self.connection_var.set("No interfaces found")
+            self.status_var.set("No Crazyflie interfaces found")
+            self._append_console("No Crazyflie interfaces found")
+
+        self._set_ui_state(self.STATE_DISCONNECTED)
+
+    def _set_uri_entry_state(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        self.uri_entry.configure(
+            state=state,
+            disabledbackground=PALETTE["field_bg"],
+            disabledforeground=PALETTE["text_dim"],
+        )
+
+    def _set_ui_state(self, state: str) -> None:
+        self.ui_state = state
+
+        if state == self.STATE_DISCONNECTED:
+            self.connect_button.configure(text="Connect")
+            self.connect_button.set_state("normal")
+            self.scan_button.configure(text="Scan")
+            self.scan_button.set_state("normal")
+            self.start_button.set_state("disabled")
+            self.stop_button.set_state("disabled")
+            self._set_uri_entry_state(True)
+        elif state == self.STATE_CONNECTING:
+            self.connect_button.configure(text="Cancel")
+            self.connect_button.set_state("normal")
+            self.scan_button.configure(text="Scan")
+            self.scan_button.set_state("disabled")
+            self.start_button.set_state("disabled")
+            self.stop_button.set_state("disabled")
+            self._set_uri_entry_state(False)
+        elif state == self.STATE_CONNECTED:
+            self.connect_button.configure(text="Disconnect")
+            self.connect_button.set_state("normal")
+            self.scan_button.configure(text="Scan")
+            self.scan_button.set_state("disabled")
+            self.start_button.set_state("normal")
+            self.stop_button.set_state("normal")
+            self._set_uri_entry_state(False)
+        elif state == self.STATE_SCANNING:
+            self.connect_button.configure(text="Connect")
+            self.connect_button.set_state("disabled")
+            self.scan_button.configure(text="Scanning...")
+            self.scan_button.set_state("disabled")
+            self.start_button.set_state("disabled")
+            self.stop_button.set_state("disabled")
+            self._set_uri_entry_state(False)
+
+    def _disconnect_session(self, reason: str) -> None:
+        self.pending_start = False
+
+        if self.worker and self.worker.is_alive():
+            self.connection_var.set("Disconnecting")
+            self.status_var.set(reason)
+            self._append_console(reason)
+            self.worker.shutdown()
+            self.worker.join(timeout=2.0)
+            if self.worker.is_alive():
+                self.status_var.set("Previous radio session is still shutting down")
+                self._append_console("ERROR: Could not stop the previous radio session cleanly")
+                return
+
+        self.worker = None
+        self._handle_disconnected()
 
     def _begin_connection(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -750,9 +916,7 @@ class DashboardApp:
             self.connection_var.set("Scanning")
             self.status_var.set("Scanning for nearby Crazyflies...")
             self._append_console("Scanning for nearby Crazyflies")
-        self.connect_button.set_state("disabled")
-        self.start_button.set_state("disabled")
-        self.stop_button.set_state("disabled")
+        self._set_ui_state(self.STATE_CONNECTING)
 
         self.worker = RadioSession(
             preferred_uri=preferred_uri,
@@ -775,6 +939,8 @@ class DashboardApp:
                 self._handle_connected(payload)
             elif event_type == "disconnected":
                 self._handle_disconnected()
+            elif event_type == "scan_result":
+                self._handle_scan_result(payload)
             elif event_type == "mission":
                 self.mission = MissionSnapshot(**payload)
                 self._render_mission()

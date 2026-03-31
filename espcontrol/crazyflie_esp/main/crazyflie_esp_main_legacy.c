@@ -2,10 +2,6 @@
  * ESP32-C3 application architecture:
  *   1) AMG8833 thermal sensor over I2C (ESP32 master, AMG8833 slave at 0x69/0x68)
  *   2) Crazyflie STM32 communication over UART (bidirectional packet link)
- *
- * Legacy note:
- *   Previous ESP32<->Crazyflie I2C bridge is disabled and preserved in
- *   legacy_cf_i2c_bridge_disabled.c.
  */
 
 #include <math.h>
@@ -140,7 +136,6 @@ static void send_detection_to_crazyflie(const inference_result_t *result, float 
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32 dual-protocol firmware starting");
-    ESP_LOGI(TAG, "Legacy ESP32<->Crazyflie I2C bridge disabled (see legacy_cf_i2c_bridge_disabled.c)");
 
     ESP_ERROR_CHECK(uart_cf_init(
         CF_UART_PORT,

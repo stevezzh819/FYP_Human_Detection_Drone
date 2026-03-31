@@ -37,6 +37,13 @@
 
 static bool isInit = false;
 
+#define PMW3901_CHIP_ID 0x49u
+#define PMW3901_CHIP_ID_INVERSE 0xB6u
+#define PMW3901_INIT_ATTEMPTS 8
+#define PMW3901_POWER_UP_DELAY_MS 100
+#define PMW3901_RESET_DELAY_MS 20
+#define PMW3901_RETRY_DELAY_MS 20
+
 static void registerWrite(const deckPin_t csPin, uint8_t reg, uint8_t value)
 {
   // Set MSB to 1 for write
@@ -128,11 +135,11 @@ static void InitRegisters(const deckPin_t csPin)
   registerWrite(csPin, 0x64, 0xFF);
   registerWrite(csPin, 0x65, 0x1F);
   registerWrite(csPin, 0x7F, 0x14);
-  registerWrite(csPin, 0x65, 0x67);
+  registerWrite(csPin, 0x65, 0x60);
   registerWrite(csPin, 0x66, 0x08);
-  registerWrite(csPin, 0x63, 0x70);
+  registerWrite(csPin, 0x63, 0x78);
   registerWrite(csPin, 0x7F, 0x15);
-  registerWrite(csPin, 0x48, 0x48);
+  registerWrite(csPin, 0x48, 0x58);
   registerWrite(csPin, 0x7F, 0x07);
   registerWrite(csPin, 0x41, 0x0D);
   registerWrite(csPin, 0x43, 0x14);
@@ -146,7 +153,7 @@ static void InitRegisters(const deckPin_t csPin)
   registerWrite(csPin, 0x40, 0x41);
   registerWrite(csPin, 0x70, 0x00);
 
-  vTaskDelay(M2T(10)); // delay 10ms
+  vTaskDelay(M2T(100));
 
   registerWrite(csPin, 0x32, 0x44);
   registerWrite(csPin, 0x7F, 0x07);
@@ -168,6 +175,27 @@ static void InitRegisters(const deckPin_t csPin)
   registerWrite(csPin, 0x54, 0x00);
 }
 
+static bool probeChipIds(const deckPin_t csPin, uint8_t *chipId, uint8_t *invChipId)
+{
+  for (int attempt = 0; attempt < PMW3901_INIT_ATTEMPTS; attempt++) {
+    registerWrite(csPin, 0x3A, 0x5A);
+    vTaskDelay(M2T(PMW3901_RESET_DELAY_MS));
+
+    *chipId = registerRead(csPin, 0x00);
+    *invChipId = registerRead(csPin, 0x5F);
+
+    DEBUG_PRINT("Motion chip id attempt %d: 0x%x:0x%x\n", attempt + 1, *chipId, *invChipId);
+
+    if (*chipId == PMW3901_CHIP_ID && *invChipId == PMW3901_CHIP_ID_INVERSE) {
+      return true;
+    }
+
+    vTaskDelay(M2T(PMW3901_RETRY_DELAY_MS));
+  }
+
+  return false;
+}
+
 bool pmw3901Init(const deckPin_t csPin)
 {
   if (isInit) {
@@ -179,7 +207,7 @@ bool pmw3901Init(const deckPin_t csPin)
   digitalWrite(csPin, HIGH);
 
   spiBegin();
-  vTaskDelay(M2T(40));
+  vTaskDelay(M2T(PMW3901_POWER_UP_DELAY_MS));
 
   digitalWrite(csPin, HIGH);
   vTaskDelay(M2T(2));
@@ -188,17 +216,11 @@ bool pmw3901Init(const deckPin_t csPin)
   digitalWrite(csPin, HIGH);
   vTaskDelay(M2T(2));
 
-  uint8_t chipId    = registerRead(csPin, 0x00);
-  uint8_t invChipId = registerRead(csPin, 0x5f);
+  uint8_t chipId = 0;
+  uint8_t invChipId = 0;
 
-  DEBUG_PRINT("Motion chip id: 0x%x:0x%x\n", chipId, invChipId);
-
-  if (chipId == 0x49 && invChipId == 0xB6)
+  if (probeChipIds(csPin, &chipId, &invChipId))
   {
-    // Power on reset
-    registerWrite(csPin, 0x3a, 0x5a);
-    vTaskDelay(M2T(5));
-
     // Reading the motion registers one time
     registerRead(csPin, 0x02);
     registerRead(csPin, 0x03);
@@ -210,6 +232,10 @@ bool pmw3901Init(const deckPin_t csPin)
     InitRegisters(csPin);
 
     isInit = true;
+  }
+  else
+  {
+    DEBUG_PRINT("Motion chip id probe failed: 0x%x:0x%x\n", chipId, invChipId);
   }
 
   return isInit;

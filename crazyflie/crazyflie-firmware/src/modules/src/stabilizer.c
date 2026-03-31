@@ -51,8 +51,6 @@
 #include "supervisor.h"
 
 #include "estimator.h"
-// Legacy ESP<->CF I2C bridge disabled for UART migration.
-// #include "esp_bridge.h"
 #include "esp_uart_bridge.h"
 #include "usddeck.h"
 #include "quatcompress.h"
@@ -194,14 +192,6 @@ void stabilizerInit(StateEstimatorType estimator)
 
   STATIC_MEM_TASK_CREATE(stabilizerTask, stabilizerTask, STABILIZER_TASK_NAME, NULL, STABILIZER_TASK_PRI);
 
-  /*
-   * Legacy I2C communication disabled:
-   * if (espBridgeInit()) {
-   *   STATIC_MEM_TASK_CREATE(espBridgeTask, espBridgeTask, "espBridge", NULL, ESP_BRIDGE_TASK_PRI);
-   * } else {
-   *   DEBUG_PRINT("ESP bridge init failed\n");
-   * }
-   */
   if (espUartBridgeInit()) {
     STATIC_MEM_TASK_CREATE(espUartBridgeTask, espUartBridgeTask, "espUartBridge", NULL, ESP_UART_BRIDGE_TASK_PRI);
   } else {
