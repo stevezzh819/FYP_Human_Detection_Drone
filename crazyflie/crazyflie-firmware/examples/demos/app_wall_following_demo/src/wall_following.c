@@ -82,16 +82,16 @@ static const float HUMAN_CONFIRM_TIME = 3.0f;  // Param/Variable for Dashboard R
 
 static const float BATTERY_CUTOFF = 2.8f;
 
-// Push-style avoidance parameters
-static const float AVOID_RADIUS = 0.4f;   // meters
-static const float AVOID_VEL_MAX = 0.3f;  // max avoidance velocity
+// // Push-style avoidance parameters
+// static const float AVOID_RADIUS = 0.4f;   // meters
+// static const float AVOID_VEL_MAX = 0.3f;  // max avoidance velocity
 
 static const float VEL_CLAMP = 0.25f;
 
 // ===================== Wall follow parameters =====================
 
 bool goLeft = false;
-float distanceToWall = 1.4f;  // Target distance that the Crazyflie tries to maintain from the wall while following it (default is 0.5).
+float distanceToWall = 0.5f;  // Target distance that the Crazyflie tries to maintain from the wall while following it (default is 0.5).
 float maxForwardSpeed = 0.25f;
 
 // ===================== Python control =====================
@@ -447,7 +447,7 @@ void appMain()
     // //Adjust height based on up ranger input
     // uint16_t up_o = radius - MIN(up,radius);
     // float cmdHeight = spHeight - up_o/1000.0f;
-    float cmdHeight = spHeight;
+    static float cmdHeight = spHeight;
 
     if (heightEstimate > 1.5f)
     {
@@ -565,31 +565,30 @@ void appMain()
       // ===================== SCAN =====================
       case mission_scan:
       {
-        float minDist = MIN(
-                            MIN(frontRange, backRange),
-                            MIN(leftRange, rightRange)
-                          );
+        // float minDist = MIN(
+        //                     MIN(frontRange, backRange),
+        //                     MIN(leftRange, rightRange)
+        //                   );
 
-        // ===== ESCAPE if too close =====
-        if (minDist < 0.25f)
-        {
-            // float factor = 0.2f;
-            float factor = 0.1f;
+        // // ===== ESCAPE if too close =====
+        // if (minDist < 0.25f)
+        // {
+        //     // float factor = 0.2f;
+        //     float factor = 0.1f;
 
-            float f_o = MAX(0.0f, 0.4f - frontRange);
-            float b_o = MAX(0.0f, 0.4f - backRange);
-            float l_o = MAX(0.0f, 0.4f - leftRange);
-            float r_o = MAX(0.0f, 0.4f - rightRange);
+        //     float f_o = MAX(0.0f, 0.4f - frontRange);
+        //     float b_o = MAX(0.0f, 0.4f - backRange);
+        //     float l_o = MAX(0.0f, 0.4f - leftRange);
+        //     float r_o = MAX(0.0f, 0.4f - rightRange);
 
-            // cmdVelX = (b_o - f_o) * factor;
-            // cmdVelY = (r_o - l_o) * factor;
-            cmdVelX += (b_o - f_o) * factor;  // additive
-            cmdVelY += (r_o - l_o) * factor;  // additive
-            cmdYawRateDeg = 0.0f;
+        //     // cmdVelX = (b_o - f_o) * factor;
+        //     // cmdVelY = (r_o - l_o) * factor;
+        //     cmdVelX += (b_o - f_o) * factor;  // additive
+        //     cmdVelY += (r_o - l_o) * factor;  // additive
+        //     cmdYawRateDeg = 0.0f;
 
-            break;
-        }
-
+        //     break;
+        // }
         cmdYawRateDeg = 36.0f;
 
         if (humanDetected)
@@ -656,6 +655,8 @@ void appMain()
       // ===================== LAND =====================
       case mission_land:
       {
+        static float landStartHeight = 0.5f;
+
         cmdVelX = 0.0f;
         cmdVelY = 0.0f;
         cmdYawRateDeg = 0.0f;
@@ -663,7 +664,7 @@ void appMain()
         float t = timeNow - missionStateStart;
 
         // Descend gradually over 3 seconds
-        cmdHeight = spHeight * MAX(0.0f, 1.0f - (t / 3.0f));
+        cmdHeight = landStartHeight * MAX(0.0f, 1.0f - (t / 3.0f));
 
         // Once low enough, disarm
         if (cmdHeight < 0.05f)
@@ -703,38 +704,80 @@ void appMain()
       }
     }
     
-    /* ===================== SMOOTH OBSTACLE AVOIDANCE ===================== */
-    // Scale factor (same idea as push demo)
-    float factor = AVOID_VEL_MAX / AVOID_RADIUS;
+    /* ===================== OBSTACLE AVOIDANCE + HEIGHT CONTROL (inspired by push.c) ===================== */
+static const float    avoidVelMax    = 1.0f;
+static const uint16_t avoidRadius    = 300;    // mm — matches push.c 'radius'
+static const uint16_t radius_up_down = 100;    // mm — matches push.c
+static const float    up_down_delta  = 0.002f; // m per tick — matches push.c
 
-    // Clamp distances to radius
-    float f = MIN(frontRange, AVOID_RADIUS);
-    float l = MIN(leftRange,  AVOID_RADIUS);
-    float r = MIN(rightRange, AVOID_RADIUS);
-    float b = MIN(backRange,  AVOID_RADIUS);
+float avoidFactor = avoidVelMax / avoidRadius;  // matches: float factor = velMax/radius;
 
-    // Compute "intrusion" (how close obstacle is)
-    float f_o = AVOID_RADIUS - f;
-    float l_o = AVOID_RADIUS - l;
-    float r_o = AVOID_RADIUS - r;
-    float b_o = AVOID_RADIUS - b;
+uint16_t left_mm  = (uint16_t)(leftRange  * 1000.0f);
+uint16_t right_mm = (uint16_t)(rightRange * 1000.0f);
+uint16_t front_mm = (uint16_t)(frontRange * 1000.0f);
+uint16_t back_mm  = (uint16_t)(backRange  * 1000.0f);
 
-    // Convert to velocities (same logic as push.c)
-    float avoidX = (-1.0f) * f_o * factor;
-    avoidX += b_o * factor;
+uint16_t left_o  = avoidRadius - MIN(left_mm,  avoidRadius);  // matches: left_o
+uint16_t right_o = avoidRadius - MIN(right_mm, avoidRadius);  // matches: right_o
+uint16_t front_o = avoidRadius - MIN(front_mm, avoidRadius);  // matches: front_o
+uint16_t back_o  = avoidRadius - MIN(back_mm,  avoidRadius);  // matches: back_o
+
+float l_comp = (-1.0f) * left_o  * avoidFactor;  // matches: float l_comp = (-1) * left_o  * factor;
+float r_comp = right_o * avoidFactor;  // matches: float r_comp = right_o  * factor;
+float velSide = r_comp + l_comp;                 // matches: float velSide = r_comp + l_comp;
+
+float f_comp = (-1.0f) * front_o * avoidFactor;  // matches: float f_comp = (-1) * front_o * factor;
+float b_comp = back_o  * avoidFactor;  // matches: float b_comp = back_o  * factor;
+float velFront = b_comp + f_comp;                // matches: float velFront = b_comp + f_comp;
+
+cmdVelX += velFront;  // replaces: setHoverSetpoint(..., velFront, velSide, ...)
+cmdVelY += velSide;
+
+// Rise if obstacles close on both sides — matches push.c
+if (left_mm < radius_up_down && right_mm < radius_up_down)
+  cmdHeight += up_down_delta;
+
+// Descend if obstacles close front and back, or something above — matches push.c
+if ((front_mm < radius_up_down && back_mm < radius_up_down) || up < avoidRadius)
+  cmdHeight -= up_down_delta;
+
+// // Height clamp (safety addition — not in push.c)
+// if (cmdHeight > 1.0f) cmdHeight = 1.0f;
+// if (cmdHeight < 0.1f) cmdHeight = 0.1f;
+/* ======================================================================================== */
+
+    // /* ===================== SMOOTH OBSTACLE AVOIDANCE (OLD) ===================== */
+    // // Scale factor (same idea as push demo)
+    // float factor = AVOID_VEL_MAX / AVOID_RADIUS;
+
+    // // Clamp distances to radius
+    // float f = MIN(frontRange, AVOID_RADIUS);
+    // float l = MIN(leftRange,  AVOID_RADIUS);
+    // float r = MIN(rightRange, AVOID_RADIUS);
+    // float b = MIN(backRange,  AVOID_RADIUS);
+
+    // // Compute "intrusion" (how close obstacle is)
+    // float f_o = AVOID_RADIUS - f;
+    // float l_o = AVOID_RADIUS - l;
+    // float r_o = AVOID_RADIUS - r;
+    // float b_o = AVOID_RADIUS - b;
+
+    // // Convert to velocities (same logic as push.c)
+    // float avoidX = (-1.0f) * f_o * factor;
+    // avoidX += b_o * factor;
     
-    float avoidY = (r_o - l_o) * factor;
+    // float avoidY = (r_o - l_o) * factor;
 
-    // === BLENDING WITH EXISTING COMMANDS ===
+    // // === BLENDING WITH EXISTING COMMANDS ===
 
-    // Weight avoidance stronger when very close
-    // float weight = MAX(f_o, MAX(l_o, r_o)) / AVOID_RADIUS;
-    float weight = MAX(MAX(f_o, b_o), MAX(l_o, r_o)) / AVOID_RADIUS;
-    weight = MIN(weight, 1.0f);
+    // // Weight avoidance stronger when very close
+    // // float weight = MAX(f_o, MAX(l_o, r_o)) / AVOID_RADIUS;
+    // float weight = MAX(MAX(f_o, b_o), MAX(l_o, r_o)) / AVOID_RADIUS;
+    // weight = MIN(weight, 1.0f);
 
-    // Blend instead of hard override
-    cmdVelX = (1.0f - weight) * cmdVelX + weight * avoidX;
-    cmdVelY = (1.0f - weight) * cmdVelY + weight * avoidY;
+    // // Blend instead of hard override
+    // cmdVelX = (1.0f - weight) * cmdVelX + weight * avoidX;
+    // cmdVelY = (1.0f - weight) * cmdVelY + weight * avoidY;
 
     // // Clamp velocity
     // cmdVelX = MAX(MIN(cmdVelX, 0.25f), -0.25f);
