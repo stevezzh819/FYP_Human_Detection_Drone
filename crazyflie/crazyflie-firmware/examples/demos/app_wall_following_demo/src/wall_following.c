@@ -77,6 +77,7 @@ static const float TRANSITION_TIME = 0.35f;
 
 // Human detection parameter(s)
 static const uint32_t HUMAN_PACKET_STALE_TIMEOUT_MS = 300U;  // Defines how long (in milliseconds) before a received ESP32 packet is considered outdated.
+
 static const float HUMAN_CONFIRM_TIME = 3.0f;  // Param/Variable for Dashboard Reading
 
 static const float BATTERY_CUTOFF = 2.8f;
@@ -108,6 +109,7 @@ static int16_t humanMaxTempX100 = 0;
 static int16_t humanThermistorX100 = 0;
 // static float humanHoldTimeS = 0.0f;
 // static uint8_t humanStable = 0U;
+
 static float humanHoldTimeS = 0.0f;  // Param/Variable for Dashboard Reading
 static uint8_t humanStable = 0U;  // Param/Variable for Dashboard Reading
 static float humanDetectStart = -1.0f;  // Param/Variable for Dashboard Reading
@@ -118,6 +120,7 @@ float humanStandOff = 1.0f;  // Desired distance that the drone should keep from
 float cmdVelX = 0.0f;
 float cmdVelY = 0.0f;
 float cmdYawRateDeg = 0.0f;
+
 static uint8_t dashboardMissionState = 0U;  // Param/Variable for Dashboard Reading
 
 // ===================== ESP32 Communication =====================
@@ -205,6 +208,7 @@ static void resetWallFollower()
 
 // Checks if all the required ESP32 log IDs have been successfully registered in the system.
 // Prevents the drone from reading garbage memory before the ESP32 bridge is fully initialised.
+
 // static bool espUartLogIdsReady(const EspUartLogIds *ids)
 // {
 //   return logVarIdIsValid(ids->detected) &&
@@ -241,6 +245,7 @@ static uint8_t getDashboardMissionState(MissionState state)
 // Called every loop tick ('while' loop)
 // Reads the ESP32 log variables, calculates how old the data is ( humanAgeMs ),
 // checks if it exceeds the 300 ms staleness window, and updates the global perception variables accordingly.
+
 static void updateHumanPerception(uint32_t nowMs)
 {
   espUartHumanDetection_t sample = {0};
@@ -409,6 +414,7 @@ void appMain()
 
 
     // -------- DISARM MOTORS IF NOT UNLOCKED --------
+
     dashboardMissionState = (stateOuterLoop == unlocked) ? getDashboardMissionState(missionState) : 0U;  // Param/Variable for Dashboard Reading
 
     if(stateOuterLoop != unlocked)
