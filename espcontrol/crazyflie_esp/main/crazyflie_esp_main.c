@@ -40,6 +40,7 @@
 #define STATUS_LED_BLINK_MS          200U
 
 #define MAIN_LOOP_PERIOD_MS          100U
+#define HEATMAP_DEBUG_PERIOD_MS      100U
 #define UART_RX_STATS_PERIOD_MS      1000U
 
 typedef struct {
@@ -433,6 +434,32 @@ static void send_detection_to_crazyflie(const inference_result_t *result, float 
     }
 }
 
+static void emit_heatmap_frame(int64_t now_ms,
+                               const float pix[64],
+                               float thermistor_c,
+                               const inference_result_t *result)
+{
+    if ((pix == NULL) || (result == NULL)) {
+        return;
+    }
+
+    printf("AMG_FRAME,%lld,%.2f,%.2f,%.2f,%u,%u,%d",
+           (long long)now_ms,
+           thermistor_c,
+           result->ambient_c,
+           result->max_temp_c,
+           result->human_detected ? 1U : 0U,
+           result->confidence,
+           result->human_dir);
+
+    for (int i = 0; i < 64; i++) {
+        printf(",%.2f", pix[i]);
+    }
+
+    printf("\n");
+    fflush(stdout);
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32 Crazyflie + AMG8833 firmware starting");
@@ -473,6 +500,7 @@ void app_main(void)
 
     int64_t last_log_ms = 0;
     int64_t last_uart_rx_stats_ms = 0;
+    int64_t last_heatmap_frame_ms = 0;
     bool last_human_detected = false;
 
     while (true) {
@@ -507,6 +535,10 @@ void app_main(void)
         const inference_result_t result = run_human_inference(pix, bg);
 
         send_detection_to_crazyflie(&result, thermistor_c);
+        if ((now_ms - last_heatmap_frame_ms) >= HEATMAP_DEBUG_PERIOD_MS) {
+            emit_heatmap_frame(now_ms, pix, thermistor_c, &result);
+            last_heatmap_frame_ms = now_ms;
+        }
         status_led_update(result.human_detected, now_ms);
 
         if (result.human_detected != last_human_detected) {
