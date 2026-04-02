@@ -51,7 +51,7 @@ def guess_port() -> Optional[str]:
         desc = (port.description or "").lower()
         hwid = (port.hwid or "").lower()
 
-        if any(tag in desc for tag in ("esp32", "usb serial", "cp210", "wch", "ch340")):
+        if any(tag in desc for tag in ("esp32", "usb serial", "usb jtag", "serial debug unit", "cp210", "wch", "ch340")):
             preferred.append(port.device)
             continue
 
