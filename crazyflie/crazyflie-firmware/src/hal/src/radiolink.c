@@ -98,9 +98,9 @@ void radiolinkInit(void)
 
   syslinkInit();
 
-  radiolinkSetChannel(configblockGetRadioChannel());
-  radiolinkSetDatarate(configblockGetRadioSpeed());
-  radiolinkSetAddress(configblockGetRadioAddress());
+  radiolinkSetChannel(RADIO_CHANNEL);
+  radiolinkSetDatarate(RADIO_DATARATE);
+  radiolinkSetAddress(RADIO_ADDRESS);
 
   isInit = true;
 }
