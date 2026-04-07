@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import pathlib
 import queue
 import threading
@@ -94,6 +95,10 @@ class FlowSnapshot:
     vel_y: float = 0.0
     cmd_x: float = 0.0
     cmd_y: float = 0.0
+    pos_x_cm: float = 0.0
+    pos_y_cm: float = 0.0
+    pos_z_cm: float = 0.0
+    pos_valid: int = 0
 
 
 @dataclass
@@ -127,6 +132,8 @@ class TelemetryCsvLogger:
         "flow_timestamp_ms",
         "delta_x",
         "delta_y",
+        "pos_x_cm",
+        "pos_y_cm",
         "height_m",
         "vel_x_mps",
         "vel_y_mps",
@@ -194,6 +201,8 @@ class TelemetryCsvLogger:
                 "flow_timestamp_ms": self.latest_flow.timestamp_ms,
                 "delta_x": self.latest_flow.delta_x,
                 "delta_y": self.latest_flow.delta_y,
+                "pos_x_cm": self.latest_flow.pos_x_cm,
+                "pos_y_cm": self.latest_flow.pos_y_cm,
                 "shutter": self.latest_flow.shutter,
                 "vel_x_mps": self.latest_flow.vel_x,
                 "vel_y_mps": self.latest_flow.vel_y,
@@ -372,6 +381,16 @@ class RadioSession(threading.Thread):
         csv_logger: Optional[TelemetryCsvLogger] = None
         logconfs: list[LogConfig] = []
         line_buffer: list[str] = []
+        latest_flow = FlowSnapshot()
+        latest_world_x = 0.0
+        latest_world_y = 0.0
+        latest_world_z = 0.0
+        latest_yaw_deg = 0.0
+        origin_capture_pending = False
+        origin_world_x: Optional[float] = None
+        origin_world_y: Optional[float] = None
+        origin_world_z: Optional[float] = None
+        origin_yaw_deg: Optional[float] = None
 
         def on_console(chars: str) -> None:
             for ch in chars:
@@ -405,20 +424,74 @@ class RadioSession(threading.Thread):
                 csv_logger.log_mission(snapshot)
             self._emit("mission", **snapshot.__dict__)
 
-        def on_flow(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
-            snapshot = FlowSnapshot(
-                timestamp_ms=ts,
-                delta_x=int(data["motion.deltaX"]),
-                delta_y=int(data["motion.deltaY"]),
-                shutter=int(data["motion.shutter"]),
-                vel_x=float(data["stateEstimate.vx"]),
-                vel_y=float(data["stateEstimate.vy"]),
-                cmd_x=float(data["app.cmdVelX"]),
-                cmd_y=float(data["app.cmdVelY"]),
-            )
+        def emit_flow_snapshot() -> None:
+            nonlocal latest_flow
+            snapshot = FlowSnapshot(**latest_flow.__dict__)
             if csv_logger is not None:
                 csv_logger.log_flow(snapshot)
             self._emit("flow", **snapshot.__dict__)
+
+        def update_relative_position() -> None:
+            nonlocal origin_capture_pending
+            nonlocal origin_world_x
+            nonlocal origin_world_y
+            nonlocal origin_world_z
+            nonlocal origin_yaw_deg
+            nonlocal latest_flow
+
+            if origin_capture_pending and origin_world_x is None:
+                origin_world_x = latest_world_x
+                origin_world_y = latest_world_y
+                origin_world_z = latest_world_z
+                origin_yaw_deg = latest_yaw_deg
+                origin_capture_pending = False
+
+            if origin_world_x is None or origin_world_y is None or origin_world_z is None or origin_yaw_deg is None:
+                latest_flow.pos_valid = 0
+                latest_flow.pos_x_cm = 0.0
+                latest_flow.pos_y_cm = 0.0
+                latest_flow.pos_z_cm = 0.0
+                return
+
+            dx = latest_world_x - origin_world_x
+            dy = latest_world_y - origin_world_y
+            dz = latest_world_z - origin_world_z
+            yaw0_rad = math.radians(origin_yaw_deg)
+
+            forward_m = (dx * math.cos(yaw0_rad)) + (dy * math.sin(yaw0_rad))
+            left_m = (-dx * math.sin(yaw0_rad)) + (dy * math.cos(yaw0_rad))
+
+            latest_flow.pos_x_cm = -left_m * 100.0
+            latest_flow.pos_y_cm = forward_m * 100.0
+            latest_flow.pos_z_cm = dz * 100.0
+            latest_flow.pos_valid = 1
+
+        def on_flow(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
+            nonlocal latest_flow
+            latest_flow.timestamp_ms = ts
+            latest_flow.delta_x = int(data["motion.deltaX"])
+            latest_flow.delta_y = int(data["motion.deltaY"])
+            latest_flow.shutter = int(data["motion.shutter"])
+            latest_flow.vel_x = float(data["stateEstimate.vx"])
+            latest_flow.vel_y = float(data["stateEstimate.vy"])
+            latest_flow.cmd_x = float(data["app.cmdVelX"])
+            latest_flow.cmd_y = float(data["app.cmdVelY"])
+            update_relative_position()
+            emit_flow_snapshot()
+
+        def on_pose(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
+            nonlocal latest_flow
+            nonlocal latest_world_x
+            nonlocal latest_world_y
+            nonlocal latest_world_z
+            nonlocal latest_yaw_deg
+            latest_flow.timestamp_ms = ts
+            latest_world_x = float(data["stateEstimate.x"])
+            latest_world_y = float(data["stateEstimate.y"])
+            latest_world_z = float(data["stateEstimate.z"])
+            latest_yaw_deg = float(data["stabilizer.yaw"])
+            update_relative_position()
+            emit_flow_snapshot()
 
         def on_range(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
             snapshot = RangeSnapshot(
@@ -492,6 +565,15 @@ class RadioSession(threading.Thread):
                 flow_cfg.error_cb.add_callback(on_log_error)
                 cf.log.add_config(flow_cfg)
 
+                pose_cfg = LogConfig(name="pose", period_in_ms=self.log_period_ms)
+                pose_cfg.add_variable("stateEstimate.x", "float")
+                pose_cfg.add_variable("stateEstimate.y", "float")
+                pose_cfg.add_variable("stateEstimate.z", "float")
+                pose_cfg.add_variable("stabilizer.yaw", "float")
+                pose_cfg.data_received_cb.add_callback(on_pose)
+                pose_cfg.error_cb.add_callback(on_log_error)
+                cf.log.add_config(pose_cfg)
+
                 range_cfg = LogConfig(name="range", period_in_ms=self.log_period_ms)
                 range_cfg.add_variable("range.front", "uint16_t")
                 range_cfg.add_variable("range.left", "uint16_t")
@@ -503,7 +585,7 @@ class RadioSession(threading.Thread):
                 range_cfg.error_cb.add_callback(on_log_error)
                 cf.log.add_config(range_cfg)
 
-                logconfs.extend([mission_cfg, flow_cfg, range_cfg])
+                logconfs.extend([mission_cfg, flow_cfg, pose_cfg, range_cfg])
                 for cfg in logconfs:
                     cfg.start()
 
@@ -519,6 +601,16 @@ class RadioSession(threading.Thread):
                         continue
 
                     if command == "set_active":
+                        origin_capture_pending = int(value or 0) == 1
+                        if origin_capture_pending:
+                            origin_world_x = None
+                            origin_world_y = None
+                            origin_world_z = None
+                            origin_yaw_deg = None
+                            latest_flow.pos_valid = 0
+                            latest_flow.pos_x_cm = 0.0
+                            latest_flow.pos_y_cm = 0.0
+                            latest_flow.pos_z_cm = 0.0
                         set_active_with_retry(int(value or 0))
                         self._emit("status", level="info", message=f"app.active={int(value or 0)}")
                     elif command == "stop":
@@ -601,6 +693,9 @@ class DashboardApp:
         self.mission = MissionSnapshot()
         self.flow = FlowSnapshot()
         self.range = RangeSnapshot()
+        self.trace_points: list[tuple[float, float, float]] = []
+        self.trace_active = False
+        self.path_breath_phase = 0.0
         self.console_lines: list[str] = []
         self.uri_var = tk.StringVar(value=args.uri or "usb://0")
         self.status_var = tk.StringVar(value="Waiting to connect")
@@ -613,13 +708,14 @@ class DashboardApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(60, self._pump_events)
+        self.root.after(80, self._animate_path_head)
         if self.args.auto_connect:
             self.root.after(150, self.connect)
 
     def _configure_root(self) -> None:
         self.root.title("Crazyflie Mission Dashboard")
-        self.root.geometry("980x760")
-        self.root.minsize(900, 700)
+        self.root.geometry("1280x960")
+        self.root.minsize(1160, 860)
         self.root.configure(bg=PALETTE["app_bg"])
 
     def _panel(self, parent: tk.Widget, title: str) -> tk.Frame:
@@ -745,23 +841,29 @@ class DashboardApp:
         cards.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         cards.grid_columnconfigure(0, weight=1)
         cards.grid_columnconfigure(1, weight=1)
-        cards.grid_rowconfigure(0, weight=1)
-        cards.grid_rowconfigure(1, weight=1)
+        cards.grid_columnconfigure(2, weight=1)
+        cards.grid_columnconfigure(3, weight=1)
+        cards.grid_rowconfigure(0, weight=3)
+        cards.grid_rowconfigure(1, weight=2)
 
         self.mission_frame = self._panel(cards, "Mission")
-        self.mission_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 9), pady=(0, 9))
+        self.mission_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 9))
         self._build_mission_panel()
 
         self.human_frame = self._panel(cards, "Human Detection")
-        self.human_frame.grid(row=0, column=1, sticky="nsew", padx=(9, 0), pady=(0, 9))
+        self.human_frame.grid(row=0, column=1, sticky="nsew", padx=6, pady=(0, 9))
         self._build_human_panel()
 
+        self.path_frame = self._panel(cards, "Flying Path")
+        self.path_frame.grid(row=0, column=2, columnspan=2, sticky="nsew", padx=(6, 0), pady=(0, 9))
+        self._build_path_panel()
+
         self.flow_frame = self._panel(cards, "Flow")
-        self.flow_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 9), pady=(9, 0))
+        self.flow_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=(0, 6), pady=(9, 0))
         self._build_flow_panel()
 
         self.range_frame = self._panel(cards, "Range Sector")
-        self.range_frame.grid(row=1, column=1, sticky="nsew", padx=(9, 0), pady=(9, 0))
+        self.range_frame.grid(row=1, column=2, columnspan=2, sticky="nsew", padx=(6, 0), pady=(9, 0))
         self._build_range_panel()
 
         console_frame = self._panel(self.root, "Status Log")
@@ -798,7 +900,7 @@ class DashboardApp:
         body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
         flags_row = tk.Frame(body, bg=PALETTE["panel_bg"])
-        flags_row.pack(fill="x", pady=(0, 10))
+        flags_row.pack(anchor="w", pady=(0, 10))
         self.fresh_value = tk.Label(flags_row, text="Fresh: --", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11))
         self.fresh_value.pack(side="left")
         self.stable_value = tk.Label(flags_row, text="Stable: --", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11))
@@ -807,12 +909,9 @@ class DashboardApp:
         self.human_led_canvas = tk.Canvas(body, width=180, height=180, bg=PALETTE["panel_bg"], highlightthickness=0)
         self.human_led_canvas.pack(pady=(6, 12))
         self.human_led_canvas.create_oval(20, 20, 160, 160, fill=PALETTE["human_off"], outline=PALETTE["text_muted"], width=4, tags="led")
-        self.human_led_canvas.create_text(90, 90, text="NO\nHUMAN", fill=PALETTE["text_main"], font=("Helvetica", 18, "bold"), tags="led_text")
-
-        self.human_status = tk.Label(body, text="Waiting for telemetry", bg=PALETTE["panel_bg"], fg=PALETTE["text_main"], font=("Helvetica", 13, "bold"))
-        self.human_status.pack(pady=(0, 10))
+        self.human_led_canvas.create_text(80, 90, text="NO\nHUMAN", fill=PALETTE["text_main"], font=("Helvetica", 18, "bold"), tags="led_text")
         self.max_temp_value = tk.Label(body, text="Max Temp: --", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11))
-        self.max_temp_value.pack(anchor="w")
+        self.max_temp_value.pack(anchor="w", pady=(0, 2))
         self.therm_value = tk.Label(body, text="Thermistor: --", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11))
         self.therm_value.pack(anchor="w")
 
@@ -824,7 +923,23 @@ class DashboardApp:
         self.shutter_value = self._value_pair(body, 1, "Shutter")
         self.vel_value = self._value_pair(body, 2, "Velocity")
         self.cmd_value = self._value_pair(body, 3, "Command")
-        self.flow_age_value = self._value_pair(body, 4, "Timestamp")
+        self.pos_x_value = self._value_pair(body, 4, "X (start)")
+        self.pos_y_value = self._value_pair(body, 5, "Y (start)")
+        self.flow_age_value = self._value_pair(body, 6, "Timestamp")
+
+    def _build_path_panel(self) -> None:
+        body = tk.Frame(self.path_frame, bg=PALETTE["panel_bg"])
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        self.path_canvas = tk.Canvas(
+            body,
+            width=300,
+            height=420,
+            bg=PALETTE["canvas_bg"],
+            highlightthickness=0,
+        )
+        self.path_canvas.pack(expand=True)
+        self.path_canvas.bind("<Configure>", lambda _event: self._render_path())
 
     def _build_range_panel(self) -> None:
         body = tk.Frame(self.range_frame, bg=PALETTE["panel_bg"])
@@ -877,6 +992,9 @@ class DashboardApp:
         self.scan_worker.start()
 
     def start_mission(self) -> None:
+        self.trace_points = []
+        self.trace_active = True
+        self._render_path()
         if not self.worker or not self.connected:
             self.pending_start = True
             self._append_console("Start requested without an active link. Reconnecting first.")
@@ -889,6 +1007,7 @@ class DashboardApp:
 
     def stop_mission(self) -> None:
         self.pending_start = False
+        self.trace_active = False
         if not self.worker or not self.connected:
             return
         self.worker.request_active(False)
@@ -931,12 +1050,141 @@ class DashboardApp:
 
     def _handle_disconnected(self) -> None:
         self.connected = False
+        self.trace_active = False
         self.connection_var.set("Disconnected")
         self.worker = None
         self._set_ui_state(self.STATE_DISCONNECTED)
         if not self.closing:
             self.status_var.set("Disconnected")
             self._append_console("Radio session stopped")
+
+    def _append_trace_point(self) -> None:
+        if not self.trace_active or not self.flow.pos_valid:
+            return
+
+        point = (self.flow.pos_x_cm, self.flow.pos_y_cm, self.flow.pos_z_cm)
+        if self.trace_points:
+            last_x, last_y, last_z = self.trace_points[-1]
+            dist_sq = ((point[0] - last_x) ** 2) + ((point[1] - last_y) ** 2) + ((point[2] - last_z) ** 2)
+            if dist_sq < 0.25:
+                return
+
+        self.trace_points.append(point)
+        if len(self.trace_points) > 1600:
+            self.trace_points = self.trace_points[-1600:]
+
+    def _render_path(self) -> None:
+        if not hasattr(self, "path_canvas"):
+            return
+
+        canvas = self.path_canvas
+        width = max(canvas.winfo_width(), 1)
+        height = max(canvas.winfo_height(), 1)
+        canvas.delete("all")
+
+        margin = 24.0
+        if not self.trace_points:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="Trace starts after Start Mission",
+                fill=PALETTE["text_dim"],
+                font=("Helvetica", 14, "bold"),
+            )
+            return
+
+        samples = [(0.0, 0.0, 0.0)] + self.trace_points
+
+        def project(point: tuple[float, float, float]) -> tuple[float, float]:
+            x_cm, y_cm, z_cm = point
+            return (x_cm + 0.55 * y_cm, -0.30 * y_cm - 0.85 * z_cm)
+
+        def project_shadow(point: tuple[float, float, float]) -> tuple[float, float]:
+            x_cm, y_cm, _z_cm = point
+            return (x_cm + 0.55 * y_cm, -0.30 * y_cm)
+
+        projected = [project(point) for point in samples]
+        shadows = [project_shadow(point) for point in samples]
+        combined = projected + shadows
+
+        min_u = min(u for u, _ in combined)
+        max_u = max(u for u, _ in combined)
+        min_v = min(v for _, v in combined)
+        max_v = max(v for _, v in combined)
+
+        span_u = max(max_u - min_u, 50.0)
+        span_v = max(max_v - min_v, 40.0)
+        scale = min((width - 2.0 * margin) / span_u, (height - 2.0 * margin) / span_v)
+        scale = max(1.1, min(scale, 4.2))
+
+        offset_x = (width - span_u * scale) / 2.0 - min_u * scale
+        offset_y = (height - span_v * scale) / 2.0 - min_v * scale
+
+        def to_screen(proj: tuple[float, float]) -> tuple[float, float]:
+            u, v = proj
+            return (offset_x + u * scale, offset_y + v * scale)
+
+        shadow_points = [to_screen(proj) for proj in shadows]
+        path_points = [to_screen(proj) for proj in projected]
+
+        floor_polygon = [
+            to_screen(project_shadow((-35.0, 0.0, 0.0))),
+            to_screen(project_shadow((35.0, 0.0, 0.0))),
+            to_screen(project_shadow((35.0, 55.0, 0.0))),
+            to_screen(project_shadow((-35.0, 55.0, 0.0))),
+        ]
+        canvas.create_polygon(
+            *[coord for point in floor_polygon for coord in point],
+            fill="#101010",
+            outline="#1b1b1b",
+            width=1,
+        )
+
+        start_shadow = shadow_points[0]
+        x_axis = to_screen(project_shadow((18.0, 0.0, 0.0)))
+        y_axis = to_screen(project_shadow((0.0, 18.0, 0.0)))
+        z_axis = to_screen(project((0.0, 0.0, 18.0)))
+        canvas.create_line(*start_shadow, *x_axis, fill="#2f2f2f", width=2)
+        canvas.create_line(*start_shadow, *y_axis, fill="#2f2f2f", width=2)
+        canvas.create_line(*start_shadow, *z_axis, fill="#383838", width=2)
+        canvas.create_text(start_shadow[0] + 8, start_shadow[1] + 12, text="START", fill=PALETTE["text_dim"], font=("Helvetica", 10, "bold"), anchor="w")
+
+        shadow_flat = [coord for point in shadow_points for coord in point]
+        path_flat = [coord for point in path_points for coord in point]
+
+        if len(shadow_points) >= 2:
+            canvas.create_line(*shadow_flat, fill="#3a2417", width=7, smooth=True, splinesteps=12)
+
+        step = max(1, len(path_points) // 10)
+        for idx in range(step, len(path_points), step):
+            canvas.create_line(
+                *shadow_points[idx],
+                *path_points[idx],
+                fill="#4a382d",
+                width=1,
+            )
+
+        if len(path_points) >= 2:
+            canvas.create_line(*path_flat, fill="#FC4C02", width=4, smooth=True, splinesteps=12)
+
+        head_x, head_y = path_points[-1]
+        shadow_x, shadow_y = shadow_points[-1]
+        canvas.create_line(shadow_x, shadow_y, head_x, head_y, fill="#6d4b3a", width=2)
+
+        breath = 0.5 * (1.0 + math.sin(self.path_breath_phase))
+        glow_r = 10.0 + 4.0 * breath
+        mid_r = 6.5 + 2.0 * breath
+        head_r = 4.0 + 1.0 * breath
+
+        canvas.create_oval(head_x - glow_r, head_y - glow_r, head_x + glow_r, head_y + glow_r, outline="#ff8a75", width=2)
+        canvas.create_oval(head_x - mid_r, head_y - mid_r, head_x + mid_r, head_y + mid_r, outline="#ff5a4f", width=3)
+        canvas.create_oval(head_x - head_r, head_y - head_r, head_x + head_r, head_y + head_r, fill="#ff3b30", outline="#ffd4ce", width=1)
+
+    def _animate_path_head(self) -> None:
+        self.path_breath_phase += 0.35
+        if self.trace_points:
+            self._render_path()
+        self.root.after(80, self._animate_path_head)
 
     def _handle_scan_result(self, payload: Dict[str, object]) -> None:
         interfaces = [str(uri) for uri in payload.get("interfaces", [])]
@@ -1073,7 +1321,9 @@ class DashboardApp:
                 self._render_human()
             elif event_type == "flow":
                 self.flow = FlowSnapshot(**payload)
+                self._append_trace_point()
                 self._render_flow()
+                self._render_path()
             elif event_type == "range":
                 self.range = RangeSnapshot(**payload)
                 self._render_mission()
@@ -1087,6 +1337,7 @@ class DashboardApp:
         self._render_mission()
         self._render_human()
         self._render_flow()
+        self._render_path()
         self._render_range()
 
     def _render_mission(self) -> None:
@@ -1103,15 +1354,13 @@ class DashboardApp:
     def _render_human(self) -> None:
         led_color = human_led_color(self.mission)
         human_text = "HUMAN" if self.mission.human else "NO\nHUMAN"
-        status_text = "Detected" if self.mission.human else "No human"
         if self.mission.human and self.mission.stable:
-            status_text = "Stable detection"
+            human_text = "STABLE"
         elif self.mission.human and self.mission.fresh:
-            status_text = "Fresh detection"
+            human_text = "FRESH"
 
         self.human_led_canvas.itemconfigure("led", fill=led_color)
         self.human_led_canvas.itemconfigure("led_text", text=human_text)
-        self.human_status.configure(text=status_text)
         self.fresh_value.configure(text=f"Fresh: {self.mission.fresh}")
         self.stable_value.configure(text=f"Stable: {self.mission.stable}")
         self.max_temp_value.configure(text=f"Max Temp: {self.mission.max_temp_c:.2f} C")
@@ -1122,6 +1371,12 @@ class DashboardApp:
         self.shutter_value.configure(text=str(self.flow.shutter))
         self.vel_value.configure(text=f"({self.flow.vel_x:.2f}, {self.flow.vel_y:.2f}) m/s")
         self.cmd_value.configure(text=f"({self.flow.cmd_x:.2f}, {self.flow.cmd_y:.2f}) m/s")
+        if self.flow.pos_valid:
+            self.pos_x_value.configure(text=f"{self.flow.pos_x_cm:.1f} cm")
+            self.pos_y_value.configure(text=f"{self.flow.pos_y_cm:.1f} cm")
+        else:
+            self.pos_x_value.configure(text="--")
+            self.pos_y_value.configure(text="--")
         self.flow_age_value.configure(text=f"{self.flow.timestamp_ms} ms")
 
     def _render_range(self) -> None:
