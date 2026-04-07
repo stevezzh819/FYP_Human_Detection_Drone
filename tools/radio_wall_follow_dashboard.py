@@ -8,9 +8,12 @@ import csv
 import math
 import pathlib
 import queue
+import shutil
+import subprocess
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Optional
@@ -20,6 +23,22 @@ import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+
+try:
+    from PIL import Image, ImageDraw
+except ImportError:
+    Image = None
+    ImageDraw = None
+
+try:
+    import plotly.graph_objects as go
+except ImportError:
+    go = None
+
+try:
+    from playsound import playsound as playsound_fn
+except ImportError:
+    playsound_fn = None
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -219,6 +238,45 @@ class TelemetryCsvLogger:
         self._file.flush()
 
 
+class SoundEffectPlayer:
+    def __init__(self) -> None:
+        self._queue: "queue.Queue[Optional[pathlib.Path]]" = queue.Queue()
+        self._afplay_path = shutil.which("afplay")
+        self._worker = threading.Thread(target=self._run, name="dashboard-sfx", daemon=True)
+        self._worker.start()
+
+    def available(self) -> bool:
+        return self._afplay_path is not None or playsound_fn is not None
+
+    def play(self, sound_path: pathlib.Path) -> bool:
+        if not sound_path.exists() or not self.available():
+            return False
+        self._queue.put(sound_path)
+        return True
+
+    def shutdown(self) -> None:
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        while True:
+            sound_path = self._queue.get()
+            if sound_path is None:
+                break
+
+            try:
+                if self._afplay_path is not None:
+                    process = subprocess.Popen(
+                        [self._afplay_path, str(sound_path)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    process.wait()
+                elif playsound_fn is not None:
+                    playsound_fn(str(sound_path))
+            except Exception:
+                pass
+
+
 class ColorButton(tk.Label):
     def __init__(
         self,
@@ -347,12 +405,18 @@ class RadioSession(threading.Thread):
         self.csv_dir = csv_dir
         self.log_period_ms = log_period_ms
         self.event_queue = event_queue
-        self.command_queue: "queue.Queue[tuple[str, Optional[int]]]" = queue.Queue()
+        self.command_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.stop_event = threading.Event()
         self.cf: Optional[Crazyflie] = None
 
     def request_active(self, active: bool) -> None:
         self.command_queue.put(("set_active", 1 if active else 0))
+
+    def request_capture_start(self) -> None:
+        self.command_queue.put(("capture_start", None))
+
+    def request_capture_stop_after(self, delay_s: float) -> None:
+        self.command_queue.put(("capture_stop_after", delay_s))
 
     def shutdown(self) -> None:
         self.stop_event.set()
@@ -387,6 +451,18 @@ class RadioSession(threading.Thread):
         latest_world_z = 0.0
         latest_yaw_deg = 0.0
         origin_capture_pending = False
+        capture_active = False
+        capture_stop_deadline: Optional[float] = None
+
+        def capture_enabled_now() -> bool:
+            nonlocal capture_active
+            nonlocal capture_stop_deadline
+
+            if capture_active and capture_stop_deadline is not None and time.monotonic() >= capture_stop_deadline:
+                capture_active = False
+                capture_stop_deadline = None
+
+            return capture_active
         origin_world_x: Optional[float] = None
         origin_world_y: Optional[float] = None
         origin_world_z: Optional[float] = None
@@ -420,14 +496,14 @@ class RadioSession(threading.Thread):
                 max_temp_c=int(data["app.humanMax"]) / 100.0,
                 therm_c=int(data["app.humanTherm"]) / 100.0,
             )
-            if csv_logger is not None:
+            if csv_logger is not None and capture_enabled_now():
                 csv_logger.log_mission(snapshot)
             self._emit("mission", **snapshot.__dict__)
 
         def emit_flow_snapshot() -> None:
             nonlocal latest_flow
             snapshot = FlowSnapshot(**latest_flow.__dict__)
-            if csv_logger is not None:
+            if csv_logger is not None and capture_enabled_now():
                 csv_logger.log_flow(snapshot)
             self._emit("flow", **snapshot.__dict__)
 
@@ -503,7 +579,7 @@ class RadioSession(threading.Thread):
                 up=int(data["range.up"]),
                 vbat=float(data["pm.vbat"]),
             )
-            if csv_logger is not None:
+            if csv_logger is not None and capture_enabled_now():
                 csv_logger.log_range(snapshot)
             self._emit("range", **snapshot.__dict__)
 
@@ -613,6 +689,14 @@ class RadioSession(threading.Thread):
                             latest_flow.pos_z_cm = 0.0
                         set_active_with_retry(int(value or 0))
                         self._emit("status", level="info", message=f"app.active={int(value or 0)}")
+                    elif command == "capture_start":
+                        capture_active = True
+                        capture_stop_deadline = None
+                        self._emit("status", level="info", message="Mission telemetry capture started")
+                    elif command == "capture_stop_after":
+                        if capture_active:
+                            capture_stop_deadline = time.monotonic() + max(float(value or 0.0), 0.0)
+                            self._emit("status", level="info", message=f"Mission telemetry capture will stop in {float(value or 0.0):.1f}s")
                     elif command == "stop":
                         break
         except Exception as exc:
@@ -696,6 +780,18 @@ class DashboardApp:
         self.trace_points: list[tuple[float, float, float]] = []
         self.trace_active = False
         self.path_breath_phase = 0.0
+        self.sfx_player = SoundEffectPlayer()
+        self.beep_sound_path = SCRIPT_DIR / "sound" / "beep.wav"
+        self.human_confirmed_sound_path = SCRIPT_DIR / "sound" / "human_confirmed.wav"
+        self.last_human_sound_snapshot = MissionSnapshot()
+        self.sound_warning_shown = False
+        self.trace_output_dir = pathlib.Path(args.csv_dir).expanduser()
+        self.trace_session_token: Optional[str] = None
+        self.trace_session_uri: Optional[str] = None
+        self.trace_exported = False
+        self.stop_capture_delay_ms = 8000
+        self.trace_stop_after_id: Optional[str] = None
+        self.latest_trace_html: Optional[pathlib.Path] = None
         self.console_lines: list[str] = []
         self.uri_var = tk.StringVar(value=args.uri or "usb://0")
         self.status_var = tk.StringVar(value="Waiting to connect")
@@ -720,15 +816,18 @@ class DashboardApp:
 
     def _panel(self, parent: tk.Widget, title: str) -> tk.Frame:
         frame = tk.Frame(parent, bg=PALETTE["panel_bg"], bd=0, highlightthickness=1, highlightbackground=PALETTE["panel_edge"])
+        header_row = tk.Frame(frame, bg=PALETTE["panel_bg"])
+        header_row.pack(fill="x", padx=16, pady=(14, 8))
         header = tk.Label(
-            frame,
+            header_row,
             text=title,
             bg=PALETTE["panel_bg"],
             fg=PALETTE["text_main"],
             font=("Helvetica", 14, "bold"),
             anchor="w",
         )
-        header.pack(fill="x", padx=16, pady=(14, 8))
+        header.pack(side="left", fill="x", expand=True)
+        setattr(frame, "_header_row", header_row)
         return frame
 
     def _value_pair(self, parent: tk.Widget, row: int, label: str) -> tk.Label:
@@ -856,6 +955,19 @@ class DashboardApp:
 
         self.path_frame = self._panel(cards, "Flying Path")
         self.path_frame.grid(row=0, column=2, columnspan=2, sticky="nsew", padx=(6, 0), pady=(0, 9))
+        self.open_path_button = ColorButton(
+            getattr(self.path_frame, "_header_row"),
+            text="Open 3D",
+            command=self.open_trace_html,
+            bg="#252525",
+            fg="#ffffff",
+            active_bg="#1b1b1b",
+            active_fg="#ffffff",
+            width=9,
+            font=("Helvetica", 10, "bold"),
+        )
+        self.open_path_button.set_state("disabled")
+        self.open_path_button.pack(side="right")
         self._build_path_panel()
 
         self.flow_frame = self._panel(cards, "Flow")
@@ -909,7 +1021,7 @@ class DashboardApp:
         self.human_led_canvas = tk.Canvas(body, width=180, height=180, bg=PALETTE["panel_bg"], highlightthickness=0)
         self.human_led_canvas.pack(pady=(6, 12))
         self.human_led_canvas.create_oval(20, 20, 160, 160, fill=PALETTE["human_off"], outline=PALETTE["text_muted"], width=4, tags="led")
-        self.human_led_canvas.create_text(80, 90, text="NO\nHUMAN", fill=PALETTE["text_main"], font=("Helvetica", 18, "bold"), tags="led_text")
+        self.human_led_canvas.create_text(90, 90, text="NO\nHUMAN", fill=PALETTE["text_main"], font=("Helvetica", 18, "bold"), tags="led_text")
         self.max_temp_value = tk.Label(body, text="Max Temp: --", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11))
         self.max_temp_value.pack(anchor="w", pady=(0, 2))
         self.therm_value = tk.Label(body, text="Thermistor: --", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11))
@@ -933,12 +1045,12 @@ class DashboardApp:
 
         self.path_canvas = tk.Canvas(
             body,
-            width=300,
-            height=420,
+            width=560,
+            height=300,
             bg=PALETTE["canvas_bg"],
             highlightthickness=0,
         )
-        self.path_canvas.pack(expand=True)
+        self.path_canvas.pack(fill="both", expand=True)
         self.path_canvas.bind("<Configure>", lambda _event: self._render_path())
 
     def _build_range_panel(self) -> None:
@@ -992,8 +1104,13 @@ class DashboardApp:
         self.scan_worker.start()
 
     def start_mission(self) -> None:
+        self._cancel_trace_stop_timer()
+        self._export_trace_image_if_needed()
         self.trace_points = []
         self.trace_active = True
+        self.trace_session_token = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.trace_session_uri = self.uri_var.get().strip() or "unknown_uri"
+        self.trace_exported = False
         self._render_path()
         if not self.worker or not self.connected:
             self.pending_start = True
@@ -1002,19 +1119,28 @@ class DashboardApp:
             return
 
         self.pending_start = False
+        self.worker.request_capture_start()
         self.worker.request_active(True)
         self._append_console("Start button pressed")
 
     def stop_mission(self) -> None:
         self.pending_start = False
-        self.trace_active = False
         if not self.worker or not self.connected:
+            self._finish_trace_capture_window()
             return
+        self._cancel_trace_stop_timer()
+        if self.trace_active:
+            self.trace_stop_after_id = self.root.after(self.stop_capture_delay_ms, self._finish_trace_capture_window)
+        self.worker.request_capture_stop_after(self.stop_capture_delay_ms / 1000.0)
         self.worker.request_active(False)
-        self._append_console("Stop button pressed")
+        self._append_console("Stop button pressed; capture will stop after landing window")
 
     def on_close(self) -> None:
         self.closing = True
+        self._cancel_trace_stop_timer()
+        self.trace_active = False
+        self._export_trace_image_if_needed()
+        self.sfx_player.shutdown()
         if self.worker:
             self.worker.shutdown()
         self.root.after(150, self.root.destroy)
@@ -1028,6 +1154,17 @@ class DashboardApp:
         self.console_text.insert("end", "\n".join(self.console_lines))
         self.console_text.see("end")
         self.console_text.configure(state="disabled")
+
+    def open_trace_html(self) -> None:
+        if self.trace_points and not self.trace_exported:
+            self._export_trace_image_if_needed()
+
+        if self.latest_trace_html is not None and self.latest_trace_html.exists():
+            webbrowser.open(self.latest_trace_html.as_uri())
+            self._append_console(f"Opened 3D path in browser: {self.latest_trace_html}")
+            return
+
+        self._append_console("No exported 3D path is available yet")
 
     def _handle_status(self, payload: Dict[str, object]) -> None:
         message = str(payload.get("message", ""))
@@ -1045,12 +1182,16 @@ class DashboardApp:
         if self.pending_start and self.worker:
             self.pending_start = False
             self.status_var.set("Link restored. Sending app.active=1")
+            self.worker.request_capture_start()
             self.worker.request_active(True)
             self._append_console("Auto-starting mission after reconnect")
 
     def _handle_disconnected(self) -> None:
         self.connected = False
+        self.last_human_sound_snapshot = MissionSnapshot()
+        self._cancel_trace_stop_timer()
         self.trace_active = False
+        self._export_trace_image_if_needed()
         self.connection_var.set("Disconnected")
         self.worker = None
         self._set_ui_state(self.STATE_DISCONNECTED)
@@ -1070,29 +1211,53 @@ class DashboardApp:
                 return
 
         self.trace_points.append(point)
-        if len(self.trace_points) > 1600:
-            self.trace_points = self.trace_points[-1600:]
+        if len(self.trace_points) > 2500:
+            self.trace_points = self.trace_points[-2500:]
 
-    def _render_path(self) -> None:
-        if not hasattr(self, "path_canvas"):
+    def _cancel_trace_stop_timer(self) -> None:
+        if self.trace_stop_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.trace_stop_after_id)
+        except Exception:
+            pass
+        self.trace_stop_after_id = None
+
+    def _finish_trace_capture_window(self) -> None:
+        self.trace_stop_after_id = None
+        if not self.trace_active:
+            return
+        self.trace_active = False
+        self._export_trace_image_if_needed()
+        self._append_console("Telemetry capture window closed")
+
+    def _play_human_sfx(self, previous: MissionSnapshot, current: MissionSnapshot) -> None:
+        if not self.connected:
             return
 
-        canvas = self.path_canvas
-        width = max(canvas.winfo_width(), 1)
-        height = max(canvas.winfo_height(), 1)
-        canvas.delete("all")
+        if not self.sfx_player.available():
+            if not self.sound_warning_shown:
+                self.sound_warning_shown = True
+                self._append_console("WARNING: No audio playback backend is available for dashboard sound effects")
+            return
+
+        if not self.beep_sound_path.exists() or not self.human_confirmed_sound_path.exists():
+            if not self.sound_warning_shown:
+                self.sound_warning_shown = True
+                self._append_console("WARNING: Human-detection sound files are missing in tools/sound")
+            return
+
+        if not previous.human and current.human:
+            self.sfx_player.play(self.beep_sound_path)
+
+        if not previous.stable and current.stable:
+            self.sfx_player.play(self.human_confirmed_sound_path)
+
+    def _build_path_scene(self, width: float, height: float) -> Optional[Dict[str, object]]:
+        if not self.trace_points:
+            return None
 
         margin = 24.0
-        if not self.trace_points:
-            canvas.create_text(
-                width / 2,
-                height / 2,
-                text="Trace starts after Start Mission",
-                fill=PALETTE["text_dim"],
-                font=("Helvetica", 14, "bold"),
-            )
-            return
-
         samples = [(0.0, 0.0, 0.0)] + self.trace_points
 
         def project(point: tuple[float, float, float]) -> tuple[float, float]:
@@ -1126,6 +1291,7 @@ class DashboardApp:
 
         shadow_points = [to_screen(proj) for proj in shadows]
         path_points = [to_screen(proj) for proj in projected]
+        start_shadow = shadow_points[0]
 
         floor_polygon = [
             to_screen(project_shadow((-35.0, 0.0, 0.0))),
@@ -1133,22 +1299,62 @@ class DashboardApp:
             to_screen(project_shadow((35.0, 55.0, 0.0))),
             to_screen(project_shadow((-35.0, 55.0, 0.0))),
         ]
+
+        x_axis = to_screen(project_shadow((18.0, 0.0, 0.0)))
+        y_axis = to_screen(project_shadow((0.0, 18.0, 0.0)))
+        z_axis = to_screen(project((0.0, 0.0, 18.0)))
+        x_axis_label = to_screen(project_shadow((22.0, 0.0, 0.0)))
+        y_axis_label = to_screen(project_shadow((0.0, 22.0, 0.0)))
+
+        return {
+            "floor_polygon": floor_polygon,
+            "start_shadow": start_shadow,
+            "x_axis": x_axis,
+            "y_axis": y_axis,
+            "z_axis": z_axis,
+            "x_axis_label": x_axis_label,
+            "y_axis_label": y_axis_label,
+            "shadow_points": shadow_points,
+            "path_points": path_points,
+        }
+
+    def _render_path(self) -> None:
+        if not hasattr(self, "path_canvas"):
+            return
+
+        canvas = self.path_canvas
+        width = max(canvas.winfo_width(), 1)
+        height = max(canvas.winfo_height(), 1)
+        canvas.delete("all")
+
+        scene = self._build_path_scene(width, height)
+        if scene is None:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="Trace starts after Start Mission",
+                fill=PALETTE["text_dim"],
+                font=("Helvetica", 14, "bold"),
+            )
+            return
+
         canvas.create_polygon(
-            *[coord for point in floor_polygon for coord in point],
+            *[coord for point in scene["floor_polygon"] for coord in point],
             fill="#101010",
             outline="#1b1b1b",
             width=1,
         )
 
-        start_shadow = shadow_points[0]
-        x_axis = to_screen(project_shadow((18.0, 0.0, 0.0)))
-        y_axis = to_screen(project_shadow((0.0, 18.0, 0.0)))
-        z_axis = to_screen(project((0.0, 0.0, 18.0)))
-        canvas.create_line(*start_shadow, *x_axis, fill="#2f2f2f", width=2)
-        canvas.create_line(*start_shadow, *y_axis, fill="#2f2f2f", width=2)
-        canvas.create_line(*start_shadow, *z_axis, fill="#383838", width=2)
+        start_shadow = scene["start_shadow"]
+        canvas.create_line(*start_shadow, *scene["x_axis"], fill="#3b3b3b", width=2)
+        canvas.create_line(*start_shadow, *scene["y_axis"], fill="#3b3b3b", width=2)
+        canvas.create_line(*start_shadow, *scene["z_axis"], fill="#383838", width=2)
         canvas.create_text(start_shadow[0] + 8, start_shadow[1] + 12, text="START", fill=PALETTE["text_dim"], font=("Helvetica", 10, "bold"), anchor="w")
+        canvas.create_text(scene["x_axis_label"][0] + 8, scene["x_axis_label"][1] + 2, text="X", fill="#7a7a7a", font=("Helvetica", 11, "bold"), anchor="w")
+        canvas.create_text(scene["y_axis_label"][0] + 8, scene["y_axis_label"][1] + 2, text="Y", fill="#7a7a7a", font=("Helvetica", 11, "bold"), anchor="w")
 
+        shadow_points = scene["shadow_points"]
+        path_points = scene["path_points"]
         shadow_flat = [coord for point in shadow_points for coord in point]
         path_flat = [coord for point in path_points for coord in point]
 
@@ -1179,6 +1385,144 @@ class DashboardApp:
         canvas.create_oval(head_x - glow_r, head_y - glow_r, head_x + glow_r, head_y + glow_r, outline="#ff8a75", width=2)
         canvas.create_oval(head_x - mid_r, head_y - mid_r, head_x + mid_r, head_y + mid_r, outline="#ff5a4f", width=3)
         canvas.create_oval(head_x - head_r, head_y - head_r, head_x + head_r, head_y + head_r, fill="#ff3b30", outline="#ffd4ce", width=1)
+
+    def _export_trace_image_if_needed(self) -> None:
+        if self.trace_exported or not self.trace_points:
+            return
+
+        safe_uri = "".join(ch if ch.isalnum() else "_" for ch in (self.trace_session_uri or "unknown_uri")).strip("_") or "unknown_uri"
+        timestamp = self.trace_session_token or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.trace_output_dir.mkdir(parents=True, exist_ok=True)
+        image_path = self.trace_output_dir / f"wall_follow_path_{timestamp}_{safe_uri}.jpg"
+        html_path = self.trace_output_dir / f"wall_follow_path_3d_{timestamp}_{safe_uri}.html"
+        self._save_path_image(image_path)
+        self._save_path_html(html_path)
+        self.trace_exported = True
+        if go is not None and html_path.exists():
+            self.latest_trace_html = html_path
+            self.open_path_button.set_state("normal")
+        if Image is not None and ImageDraw is not None:
+            self._append_console(f"Saved flying path image to {image_path}")
+        if go is not None:
+            self._append_console(f"Saved interactive 3D path to {html_path}")
+
+    def _save_path_image(self, output_path: pathlib.Path) -> None:
+        if Image is None or ImageDraw is None:
+            return
+
+        width = 1280
+        height = 900
+        scene = self._build_path_scene(width, height)
+        if scene is None:
+            return
+
+        image = Image.new("RGBA", (width, height), PALETTE["canvas_bg"])
+        draw = ImageDraw.Draw(image, "RGBA")
+
+        draw.polygon(scene["floor_polygon"], fill=(16, 16, 16, 255), outline=(27, 27, 27, 255))
+
+        start_shadow = scene["start_shadow"]
+        draw.line([start_shadow, scene["x_axis"]], fill=(80, 80, 80, 150), width=4)
+        draw.line([start_shadow, scene["y_axis"]], fill=(80, 80, 80, 150), width=4)
+        draw.line([start_shadow, scene["z_axis"]], fill=(64, 64, 64, 170), width=4)
+        draw.text((start_shadow[0] + 14, start_shadow[1] + 14), "START", fill=(138, 138, 138, 220))
+        draw.text((scene["x_axis_label"][0] + 12, scene["x_axis_label"][1] + 2), "X", fill=(150, 150, 150, 120))
+        draw.text((scene["y_axis_label"][0] + 12, scene["y_axis_label"][1] + 2), "Y", fill=(150, 150, 150, 120))
+
+        shadow_points = scene["shadow_points"]
+        path_points = scene["path_points"]
+        if len(shadow_points) >= 2:
+            draw.line(shadow_points, fill=(58, 36, 23, 220), width=16)
+
+        step = max(1, len(path_points) // 10)
+        for idx in range(step, len(path_points), step):
+            draw.line([shadow_points[idx], path_points[idx]], fill=(74, 56, 45, 180), width=2)
+
+        if len(path_points) >= 2:
+            draw.line(path_points, fill=(252, 76, 2, 255), width=9)
+
+        head_x, head_y = path_points[-1]
+        shadow_x, shadow_y = shadow_points[-1]
+        draw.line([(shadow_x, shadow_y), (head_x, head_y)], fill=(109, 75, 58, 220), width=3)
+        draw.ellipse((head_x - 26, head_y - 26, head_x + 26, head_y + 26), outline=(255, 138, 117, 160), width=4)
+        draw.ellipse((head_x - 16, head_y - 16, head_x + 16, head_y + 16), outline=(255, 90, 79, 220), width=5)
+        draw.ellipse((head_x - 9, head_y - 9, head_x + 9, head_y + 9), fill=(255, 59, 48, 255), outline=(255, 212, 206, 255), width=2)
+
+        image.convert("RGB").save(output_path, format="JPEG", quality=92)
+
+    def _save_path_html(self, output_path: pathlib.Path) -> None:
+        if go is None or not self.trace_points:
+            return
+
+        xs = [point[0] for point in self.trace_points]
+        ys = [point[1] for point in self.trace_points]
+        zs = [point[2] for point in self.trace_points]
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter3d(
+                x=xs,
+                y=ys,
+                z=zs,
+                mode="lines",
+                line={"color": "#FC4C02", "width": 6},
+                name="Trace",
+            )
+        )
+        fig.add_trace(
+            go.Scatter3d(
+                x=[xs[-1]],
+                y=[ys[-1]],
+                z=[zs[-1]],
+                mode="markers",
+                marker={"size": 7, "color": "#ff3b30"},
+                name="Current Position",
+            )
+        )
+        fig.add_trace(
+            go.Scatter3d(
+                x=[0.0],
+                y=[0.0],
+                z=[0.0],
+                mode="markers",
+                marker={"size": 5, "color": "#9a9a9a"},
+                name="Start",
+            )
+        )
+
+        fig.update_layout(
+            template="plotly_dark",
+            title="Crazyflie Flying Path",
+            paper_bgcolor="#080808",
+            plot_bgcolor="#080808",
+            scene={
+                "xaxis": {
+                    "title": "X (cm)",
+                    "backgroundcolor": "rgba(0,0,0,0)",
+                    "gridcolor": "rgba(150,150,150,0.18)",
+                    "zerolinecolor": "rgba(180,180,180,0.28)",
+                },
+                "yaxis": {
+                    "title": "Y (cm)",
+                    "backgroundcolor": "rgba(0,0,0,0)",
+                    "gridcolor": "rgba(150,150,150,0.18)",
+                    "zerolinecolor": "rgba(180,180,180,0.28)",
+                },
+                "zaxis": {
+                    "title": "Z (cm)",
+                    "backgroundcolor": "rgba(0,0,0,0)",
+                    "gridcolor": "rgba(150,150,150,0.18)",
+                    "zerolinecolor": "rgba(180,180,180,0.28)",
+                },
+                "aspectmode": "data",
+                "camera": {
+                    "eye": {"x": 1.45, "y": -1.6, "z": 1.15},
+                },
+            },
+            margin={"l": 0, "r": 0, "t": 50, "b": 0},
+            legend={"orientation": "h", "yanchor": "bottom", "y": 0.98, "xanchor": "right", "x": 1.0},
+        )
+        fig.write_html(str(output_path), include_plotlyjs=True, full_html=True)
 
     def _animate_path_head(self) -> None:
         self.path_breath_phase += 0.35
@@ -1316,7 +1660,10 @@ class DashboardApp:
             elif event_type == "scan_result":
                 self._handle_scan_result(payload)
             elif event_type == "mission":
-                self.mission = MissionSnapshot(**payload)
+                mission_snapshot = MissionSnapshot(**payload)
+                self._play_human_sfx(self.last_human_sound_snapshot, mission_snapshot)
+                self.last_human_sound_snapshot = mission_snapshot
+                self.mission = mission_snapshot
                 self._render_mission()
                 self._render_human()
             elif event_type == "flow":
@@ -1354,10 +1701,6 @@ class DashboardApp:
     def _render_human(self) -> None:
         led_color = human_led_color(self.mission)
         human_text = "HUMAN" if self.mission.human else "NO\nHUMAN"
-        if self.mission.human and self.mission.stable:
-            human_text = "STABLE"
-        elif self.mission.human and self.mission.fresh:
-            human_text = "FRESH"
 
         self.human_led_canvas.itemconfigure("led", fill=led_color)
         self.human_led_canvas.itemconfigure("led_text", text=human_text)
