@@ -57,9 +57,11 @@ MISSION_NAMES = {
     0: "Reacquire Wall",
     1: "Wall Follow",
     2: "Scan",
-    3: "Signal",
-    4: "Land",
-    5: "Transition",
+    3: "Approach",
+    4: "Bob",
+    5: "Land",
+    6: "Transition",
+    7: "Align",
 }
 
 DIR_NAMES = {

@@ -81,7 +81,7 @@ static const uint32_t HUMAN_PACKET_STALE_TIMEOUT_MS = 300U;  // Defines how long
 
 static const float HUMAN_CONFIRM_TIME = 3.0f;  // Param/Variable for Dashboard Reading
 
-static const float BATTERY_CUTOFF = 2.8f;
+static const float BATTERY_CUTOFF = 2.2f;
 // static const float BATTERY_CUTOFF = 2.0f;
 
 // Push-style avoidance parameters
