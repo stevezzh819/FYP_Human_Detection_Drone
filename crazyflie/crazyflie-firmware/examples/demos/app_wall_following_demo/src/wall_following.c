@@ -67,7 +67,8 @@ Modified by: Bock Kai Sheng, Hu Linxi, Zhang Zehua (NUS Electrical Engineering s
 
 // ===================== Parameters =====================
 
-static const float spHeight = 0.5f;
+// static const float spHeight = 0.5f;
+static const float spHeight = 0.8f;
 static const uint16_t radius = 300;
 
 static const float REACQUIRE_TIMEOUT = 10.0f;  // Give up searching for wall, go scan
@@ -80,12 +81,13 @@ static const uint32_t HUMAN_PACKET_STALE_TIMEOUT_MS = 300U;  // Defines how long
 
 static const float HUMAN_CONFIRM_TIME = 3.0f;  // Param/Variable for Dashboard Reading
 
-static const float BATTERY_CUTOFF = 2.8f;
+// static const float BATTERY_CUTOFF = 2.8f;
+static const float BATTERY_CUTOFF = 2.0f;
 
 // Push-style avoidance parameters
 // static const float AVOID_RADIUS = 0.4f;   // meters
-static const float AVOID_RADIUS = 0.5f;
-static const float AVOID_VEL_MAX = 0.3f;  // max avoidance velocity
+static const float AVOID_RADIUS = 0.3f;
+static const float AVOID_VEL_MAX = 0.1f;  // max avoidance velocity
 
 static const float VEL_CLAMP = 0.3f;
 
@@ -93,7 +95,7 @@ static const float VEL_CLAMP = 0.3f;
 
 bool goLeft = false;
 // float distanceToWall = 0.5f;  // Target distance that the Crazyflie tries to maintain from the wall while following it (default is 0.5).
-float distanceToWall = 0.5f;
+float distanceToWall = 0.8f;
 // float maxForwardSpeed = 0.25f;
 float maxForwardSpeed = 0.2f;
 
@@ -124,6 +126,9 @@ float cmdVelX = 0.0f;
 float cmdVelY = 0.0f;
 float cmdYawRateDeg = 0.0f;
 static float cmdHeight = 0.5f; 
+
+static float scanHoldX = 0.0f;  // ADD: XY position locked at scan entry
+static float scanHoldY = 0.0f;  // ADD
 
 static uint8_t dashboardMissionState = 0U;  // Param/Variable for Dashboard Reading
 
@@ -195,6 +200,25 @@ static void setVelocitySetpoint(setpoint_t *setpoint,
   setpoint->velocity.y = vy;
 
   setpoint->velocity_body = true;
+}
+
+// Position hold + yaw rate setpoint — used during mission_scan
+static void setScanSetpoint(setpoint_t *setpoint,
+                            float x, float y,
+                            float z, float yawrate)
+{
+  setpoint->mode.z   = modeAbs;
+  setpoint->position.z = z;
+
+  setpoint->mode.yaw = modeVelocity;
+  setpoint->attitudeRate.yaw = yawrate;
+
+  setpoint->mode.x   = modeAbs;   // hold X position (world frame)
+  setpoint->mode.y   = modeAbs;   // hold Y position (world frame)
+  setpoint->position.x = x;
+  setpoint->position.y = y;
+
+  setpoint->velocity_body = false;  // position is always world frame
 }
 
 static void missionTransition(MissionState next, float now)
@@ -319,6 +343,9 @@ void appMain()
 
   logVarId_t idVbat = logGetVarId("pm","vbat");
 
+  logVarId_t idX = logGetVarId("stateEstimate","x");
+  logVarId_t idY = logGetVarId("stateEstimate","y");
+
   // EspUartLogIds espUartIds = {
   //   .detected = logGetVarId("espUart", "detected"),
   //   .confidence = logGetVarId("espUart", "confidence"),
@@ -341,7 +368,6 @@ void appMain()
   while(1)
   {
     vTaskDelay(M2T(10));
-
     // Check if decks are properly mounted
     uint8_t positioningInit = paramGetUint(idPositioningDeck);
     uint8_t multirangerInit = paramGetUint(idMultiranger);
@@ -440,6 +466,13 @@ void appMain()
     float backRange  = logGetUint(idBack)/1000.0f;
     // float upRange    = logGetUint(idUp)/1000.0f;
 
+    // ADD: Clamp invalid sensor readings (VL53L1x returns 32766 mm on error)
+    static const float RANGE_MAX_VALID = 3.0f;                          // ADD
+    if (frontRange > RANGE_MAX_VALID) frontRange = RANGE_MAX_VALID;     // ADD
+    if (leftRange  > RANGE_MAX_VALID) leftRange  = RANGE_MAX_VALID;     // ADD
+    if (rightRange > RANGE_MAX_VALID) rightRange = RANGE_MAX_VALID;     // ADD
+    if (backRange  > RANGE_MAX_VALID) backRange  = RANGE_MAX_VALID;     // ADD
+
     float sideRange;
 
     if(goLeft)
@@ -447,6 +480,8 @@ void appMain()
     else
       sideRange = logGetUint(idLeft)/1000.0f;
 
+    if (sideRange > RANGE_MAX_VALID) sideRange = RANGE_MAX_VALID;       // ADD
+    
     float yawDeg = logGetFloat(idYaw);
     float yawRad = yawDeg * (float)M_PI / 180.0f;
 
@@ -577,6 +612,8 @@ void appMain()
         }
         else if (timeNow - missionStateStart > REACQUIRE_TIMEOUT)
         {
+          scanHoldX = logGetFloat(idX);   // capture before transitioning
+          scanHoldY = logGetFloat(idY);
           missionTransition(mission_scan, timeNow);
         }
       }
@@ -623,6 +660,8 @@ void appMain()
         }
         else if (timeNow - missionStateStart > WALLFOLLOW_TIME)
         {
+          scanHoldX = logGetFloat(idX);   // capture before transitioning
+          scanHoldY = logGetFloat(idY);
           missionTransition(mission_scan,timeNow);
         }
       }
@@ -631,40 +670,153 @@ void appMain()
       // ===================== SCAN =====================
       case mission_scan:
       {
-        cmdYawRateDeg = 36.0f;   // always spin
-        cmdHeight = spHeight;
+          cmdYawRateDeg = 36.0f;   // always spin
+          cmdHeight = spHeight;
+          // scanHoldX/Y captured before missionTransition() was called
 
-        float minDist = MIN(
-                            MIN(frontRange, backRange),
-                            MIN(leftRange, rightRange)
-                          );
+          float minDist = MIN(
+                              MIN(frontRange, backRange),
+                              MIN(leftRange, rightRange)
+                            );
 
-        // ===== ESCAPE if too close =====
-        if (minDist < AVOID_RADIUS)
-        {
-            // float factor = 0.2f;
-            float factor = 0.1f;
-            float f_o = MAX(0.0f, AVOID_RADIUS - frontRange);
-            float b_o = MAX(0.0f, AVOID_RADIUS - backRange);
-            float l_o = MAX(0.0f, AVOID_RADIUS - leftRange);
-            float r_o = MAX(0.0f, AVOID_RADIUS - rightRange);
+          // setScanSetpoint(&setpoint, scanHoldX, scanHoldY, cmdHeight, cmdYawRateDeg);
+          // ===== ESCAPE if any wall is too close =====
+          if (minDist < AVOID_RADIUS)
+          {
+              float factor = AVOID_VEL_MAX / AVOID_RADIUS;
+              float f_o = MAX(0.0f, AVOID_RADIUS - frontRange);
+              float b_o = MAX(0.0f, AVOID_RADIUS - backRange);
+              float l_o = MAX(0.0f, AVOID_RADIUS - leftRange);
+              float r_o = MAX(0.0f, AVOID_RADIUS - rightRange);
 
-            // cmdVelX = (b_o - f_o) * factor;
-            // cmdVelY = (r_o - l_o) * factor;
-            cmdVelX += (b_o - f_o) * factor;  // additive
-            cmdVelY += (r_o - l_o) * factor;  // additive
-        }
+              cmdVelX += (b_o - f_o) * factor;
+              cmdVelY += (r_o - l_o) * factor;
+              setVelocitySetpoint(&setpoint, cmdVelX, cmdVelY, cmdHeight, cmdYawRateDeg);
+          }
+          // ===== POSITION HOLD when no wall is close =====
+          else
+          {
+              setScanSetpoint(&setpoint, scanHoldX, scanHoldY, cmdHeight, cmdYawRateDeg);
+          }
 
-        if (humanDetected)
-        {
-          missionTransition(mission_approach, timeNow);
-        }
-        else if (timeNow - missionStateStart > SCAN_TIME)
-        {
-          missionTransition(mission_reacquire_wall, timeNow);
-        }
+          commanderSetSetpoint(&setpoint, 3);
+
+          if (humanDetected)
+          {
+              missionTransition(mission_approach, timeNow);
+          }
+          else if (timeNow - missionStateStart > SCAN_TIME)
+          {
+              missionTransition(mission_reacquire_wall, timeNow);
+          }
       }
       break;
+
+
+      // case mission_scan:
+      // {
+      //   cmdYawRateDeg = 36.0f;   // always spin
+      //   cmdHeight = spHeight;
+
+      //   // Capture the XY position once when this state is first entered.
+      //   // missionStateStart is set by missionTransition(), so comparing against
+      //   // it detects the first tick in this state.
+      //   static float scanHoldX = 0.0f;
+      //   static float scanHoldY = 0.0f;
+      //   static float lastScanStart = -1.0f;
+      //   if (lastScanStart != missionStateStart)
+      //   {
+      //     scanHoldX = logGetFloat(idX);
+      //     scanHoldY = logGetFloat(idY);
+      //     lastScanStart = missionStateStart;
+      //   }
+
+      //   float minDist = MIN(
+      //                       MIN(frontRange, backRange),
+      //                       MIN(leftRange, rightRange)
+      //                     );
+
+      //   // ===== ESCAPE if any wall is too close =====
+      //   // Uses velocity setpoint so the push is in body frame.
+      //   // Takes full priority over position hold.
+      //   if (minDist < AVOID_RADIUS)
+      //   {
+      //       float factor = AVOID_VEL_MAX / AVOID_RADIUS;
+      //       float f_o = MAX(0.0f, AVOID_RADIUS - frontRange);
+      //       float b_o = MAX(0.0f, AVOID_RADIUS - backRange);
+      //       float l_o = MAX(0.0f, AVOID_RADIUS - leftRange);
+      //       float r_o = MAX(0.0f, AVOID_RADIUS - rightRange);
+
+      //       cmdVelX = (b_o - f_o) * factor;
+      //       cmdVelY = (r_o - l_o) * factor;
+      //       setVelocitySetpoint(&setpoint, cmdVelX, cmdVelY, cmdHeight, cmdYawRateDeg);
+      //   }
+      //   // ===== POSITION HOLD when no wall is close =====
+      //   // Locks XY to the position captured on scan entry.
+      //   else
+      //   {
+      //       setScanSetpoint(&setpoint, scanHoldX, scanHoldY, cmdHeight, cmdYawRateDeg);
+      //   }
+
+      //   commanderSetSetpoint(&setpoint, 3);
+
+      //   if (humanDetected)
+      //   {
+      //     missionTransition(mission_approach, timeNow);
+      //   }
+      //   else if (timeNow - missionStateStart > SCAN_TIME)
+      //   {
+      //     missionTransition(mission_reacquire_wall, timeNow);
+      //   }
+      // }
+      // break;
+      // case mission_scan:
+      // {
+      //   cmdYawRateDeg = 36.0f;   // always spin
+      //   cmdHeight = spHeight;
+
+      //   float minDist = MIN(
+      //                       MIN(frontRange, backRange),
+      //                       MIN(leftRange, rightRange)
+      //                     );
+
+      //   // ===== ESCAPE if too close =====
+      //   if (minDist < AVOID_RADIUS)
+      //   {
+      //       float factor = AVOID_VEL_MAX / AVOID_RADIUS;
+      //       float f_o = MAX(0.0f, AVOID_RADIUS - frontRange);
+      //       float b_o = MAX(0.0f, AVOID_RADIUS - backRange);
+      //       float l_o = MAX(0.0f, AVOID_RADIUS - leftRange);
+      //       float r_o = MAX(0.0f, AVOID_RADIUS - rightRange);
+
+      //       cmdVelX = (b_o - f_o) * factor;  // hard override
+      //       cmdVelY = (r_o - l_o) * factor;  // hard override
+      //   }
+      //   // if (minDist < AVOID_RADIUS)
+      //   // {
+      //   //     // float factor = 0.2f;
+      //   //     float factor = 0.1f;
+      //   //     float f_o = MAX(0.0f, AVOID_RADIUS - frontRange);
+      //   //     float b_o = MAX(0.0f, AVOID_RADIUS - backRange);
+      //   //     float l_o = MAX(0.0f, AVOID_RADIUS - leftRange);
+      //   //     float r_o = MAX(0.0f, AVOID_RADIUS - rightRange);
+
+      //   //     // cmdVelX = (b_o - f_o) * factor;
+      //   //     // cmdVelY = (r_o - l_o) * factor;
+      //   //     cmdVelX += (b_o - f_o) * factor;  // additive
+      //   //     cmdVelY += (r_o - l_o) * factor;  // additive
+      //   // }
+
+      //   if (humanDetected)
+      //   {
+      //     missionTransition(mission_approach, timeNow);
+      //   }
+      //   else if (timeNow - missionStateStart > SCAN_TIME)
+      //   {
+      //     missionTransition(mission_reacquire_wall, timeNow);
+      //   }
+      // }
+      // break;
 
       // ===================== APPROACH =====================
       case mission_approach:  // Might have to entirely remove this state and just go straight to mission_bob once humanDetected=True
@@ -817,7 +969,7 @@ void appMain()
 
     
 /* ===================== SMOOTH OBSTACLE AVOIDANCE (NEW: Only uses right and back sensor. Front and left sensors will be used from wallFollower() library automatically) ===================== */
-    bool holdStill = (missionState == mission_land || missionState == mission_bob || missionState == mission_scan);
+    bool holdStill = (missionState == mission_land || missionState == mission_bob);
     
     if (!holdStill)
     {
@@ -932,26 +1084,26 @@ void appMain()
     // prevCmdY = cmdVelY;
     // // =====================================================
 
-    // Smoothing to avoid oscillations
-    static float prevX = 0, prevY = 0;  // 'static' ensures the value is remembered across loop iterations
+    // // Smoothing to avoid oscillations
+    // static float prevX = 0, prevY = 0;  // 'static' ensures the value is remembered across loop iterations
     
-    // Reset smoothing history when drone should be stationary
-    // if (missionState == mission_land || missionState == mission_bob)
+    // // Reset smoothing history when drone should be stationary
+    // // if (missionState == mission_land || missionState == mission_bob)
+    // // {
+    // //     prevX = 0.0f;
+    // //     prevY = 0.0f;
+    // // }
+    // if (missionState == mission_land || missionState == mission_bob ||
+    //     stateInnerLoop == rotateInCorner || stateInnerLoop == turnToFindWall)
     // {
     //     prevX = 0.0f;
     //     prevY = 0.0f;
     // }
-    if (missionState == mission_land || missionState == mission_bob ||
-        stateInnerLoop == rotateInCorner || stateInnerLoop == turnToFindWall)
-    {
-        prevX = 0.0f;
-        prevY = 0.0f;
-    }
 
-    cmdVelX = 0.7f * prevX + 0.3f * cmdVelX;  // 70% old value + 30% new value
-    cmdVelY = 0.7f * prevY + 0.3f * cmdVelY;  // 70% old value + 30% new value
-    prevX = cmdVelX;
-    prevY = cmdVelY;
+    // cmdVelX = 0.7f * prevX + 0.3f * cmdVelX;  // 70% old value + 30% new value
+    // cmdVelY = 0.7f * prevY + 0.3f * cmdVelY;  // 70% old value + 30% new value
+    // prevX = cmdVelX;
+    // prevY = cmdVelY;
 
     // Clamp velocity
     cmdVelX = MAX(MIN(cmdVelX, VEL_CLAMP), -VEL_CLAMP);
@@ -959,8 +1111,15 @@ void appMain()
 
     dashboardMissionState = getDashboardMissionState(missionState);  // Param/Variable for Dashboard Reading
     
-    setVelocitySetpoint(&setpoint,cmdVelX,cmdVelY,cmdHeight,cmdYawRateDeg);
-    commanderSetSetpoint(&setpoint,3);
+    // mission_scan dispatches its own setpoint (position hold or escape velocity)
+    // so skip the global dispatch for that state to avoid overwriting it.
+    if (missionState != mission_scan)
+    {
+      setVelocitySetpoint(&setpoint, cmdVelX, cmdVelY, cmdHeight, cmdYawRateDeg);
+      commanderSetSetpoint(&setpoint, 3);
+    }
+    // setVelocitySetpoint(&setpoint,cmdVelX,cmdVelY,cmdHeight,cmdYawRateDeg);
+    // commanderSetSetpoint(&setpoint,3);
   }
 }
 
