@@ -1,0 +1,1 @@
+local_time_iso,local_time_ms,uri,source,cf_timestamp_ms,mission_timestamp_ms,outer,mission,z_m,human,human_fresh,human_stable,human_hold_s,human_confidence_pct,human_direction,human_max_temp_c,human_thermistor_c,flow_timestamp_ms,delta_x,delta_y,shutter,vel_x_mps,vel_y_mps,cmd_x_mps,cmd_y_mps,range_timestamp_ms,front_mm,left_mm,right_mm,back_mm,up_mm,vbat_v
