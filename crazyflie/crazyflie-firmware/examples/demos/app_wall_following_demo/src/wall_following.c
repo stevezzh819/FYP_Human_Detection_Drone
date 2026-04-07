@@ -99,8 +99,8 @@ bool goLeft = false;
 // bool goLeft = true;
 float distanceToWall = 0.5f;  // Target distance that the Crazyflie tries to maintain from the wall while following it (default is 0.5).
 // float distanceToWall = 0.8f;
-// float maxForwardSpeed = 0.25f;
-float maxForwardSpeed = 0.2f;
+float maxForwardSpeed = 0.25f;
+// float maxForwardSpeed = 0.2f;
 
 // ===================== Python control =====================
 
@@ -1052,40 +1052,60 @@ void appMain()
 // /* ======================================================================================== */
 
     
-/* ===================== SMOOTH OBSTACLE AVOIDANCE (NEW: Only uses right and back sensor. Front and left sensors will be used from wallFollower() library automatically) ===================== */
+    /* ===================== SMOOTH OBSTACLE AVOIDANCE (NEW: Only uses right and back sensor. Front and left sensors will be used from wallFollower() library automatically) ===================== */
     bool holdStill = (missionState == mission_land || missionState == mission_bob || missionState == mission_scan || missionState == mission_align);
     
     if (!holdStill)
     {
-        float factor = AVOID_VEL_MAX / AVOID_RADIUS;
+        // SGBA-style avoidance: fixed per-axis push when sensor is within save_distance.
+        // Adapted for maze application: back avoidance added since drone can back into walls
+        // during reacquire/wallfollow. Additive on top of wall follower output (same as SGBA).
+        float save_distance = AVOID_RADIUS;   // tune: distance at which avoidance activates
+        float push_vel = 0.5f;   // fixed push velocity (matches SGBA's 0.5 m/s)
 
-        float b_o     = MAX(0.0f, AVOID_RADIUS - backRange);
-        float front_o = MAX(0.0f, AVOID_RADIUS - frontRange);
+        float temp_vel_x = cmdVelX;   // start from wall follower output
+        float temp_vel_y = cmdVelY;
 
-        float opp_o = goLeft ? MAX(0.0f, AVOID_RADIUS - leftRange)
-                     : MAX(0.0f, AVOID_RADIUS - rightRange);
+        if (frontRange < save_distance) temp_vel_x -= push_vel;   // front wall → push backward
+        if (backRange  < save_distance) temp_vel_x += push_vel;   // back wall  → push forward
+        if (leftRange  < save_distance) temp_vel_y -= push_vel;   // left wall  → push right
+        if (rightRange < save_distance) temp_vel_y += push_vel;   // right wall → push left
 
-        float avoidX = (b_o - front_o) * factor;
-        float avoidY = goLeft ? (-opp_o * factor)   // obstacle on left → push right (-Y)
-                              : (opp_o * factor);    // obstacle on right → push left (+Y)
-        // float opp_o = goLeft ? MAX(0.0f, AVOID_RADIUS - rightRange)
-        //                     : MAX(0.0f, AVOID_RADIUS - leftRange);
+        cmdVelX = temp_vel_x;
+        cmdVelY = temp_vel_y;
+    }
 
-        // // float opp_o = goLeft ? MAX(0.0f, AVOID_RADIUS - leftRange)
-        // //                     : MAX(0.0f, AVOID_RADIUS - rightRange);
+    // if (!holdStill)
+    // {
+    //     float factor = AVOID_VEL_MAX / AVOID_RADIUS;
+
+    //     float b_o     = MAX(0.0f, AVOID_RADIUS - backRange);
+    //     float front_o = MAX(0.0f, AVOID_RADIUS - frontRange);
+
+    //     float opp_o = goLeft ? MAX(0.0f, AVOID_RADIUS - leftRange)
+    //                  : MAX(0.0f, AVOID_RADIUS - rightRange);
+
+    //     float avoidX = (b_o - front_o) * factor;
+    //     float avoidY = goLeft ? (-opp_o * factor)   // obstacle on left → push right (-Y)
+    //                           : (opp_o * factor);    // obstacle on right → push left (+Y)
+    //     // float opp_o = goLeft ? MAX(0.0f, AVOID_RADIUS - rightRange)
+    //     //                     : MAX(0.0f, AVOID_RADIUS - leftRange);
+
+    //     // // float opp_o = goLeft ? MAX(0.0f, AVOID_RADIUS - leftRange)
+    //     // //                     : MAX(0.0f, AVOID_RADIUS - rightRange);
         
 
-        // float avoidX = (b_o - front_o) * factor;   // back pushes forward, front pushes backward (braking)
-        // // float avoidY = goLeft ? (-opp_o * factor) : (opp_o * factor);
-        // float avoidY = goLeft ? (opp_o * factor)   // move left (+Y)
-        //               : (-opp_o * factor); // move right (-Y)
+    //     // float avoidX = (b_o - front_o) * factor;   // back pushes forward, front pushes backward (braking)
+    //     // // float avoidY = goLeft ? (-opp_o * factor) : (opp_o * factor);
+    //     // float avoidY = goLeft ? (opp_o * factor)   // move left (+Y)
+    //     //               : (-opp_o * factor); // move right (-Y)
 
-        float weight = MAX(MAX(b_o, front_o), opp_o) / AVOID_RADIUS;
-        weight = MIN(weight, 1.0f);
+    //     float weight = MAX(MAX(b_o, front_o), opp_o) / AVOID_RADIUS;
+    //     weight = MIN(weight, 1.0f);
 
-        cmdVelX = (1.0f - weight) * cmdVelX + weight * avoidX;
-        cmdVelY = (1.0f - weight) * cmdVelY + weight * avoidY;
-    }
+    //     cmdVelX = (1.0f - weight) * cmdVelX + weight * avoidX;
+    //     cmdVelY = (1.0f - weight) * cmdVelY + weight * avoidY;
+    // }
 
     // if (!holdStill)
     // {
