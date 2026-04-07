@@ -546,7 +546,7 @@ void appMain()
         
         if(timeNow - missionStateStart > TRANSITION_TIME)
         {
-          if(nextMissionState == mission_reacquire_wall || nextMissionState == mission_wallfollow)
+          if(nextMissionState == mission_reacquire_wall)
             resetWallFollower();
 
           missionState = nextMissionState;
@@ -817,25 +817,51 @@ void appMain()
 
     
 /* ===================== SMOOTH OBSTACLE AVOIDANCE (NEW: Only uses right and back sensor. Front and left sensors will be used from wallFollower() library automatically) ===================== */
-    bool holdStill = (missionState == mission_land || missionState == mission_bob);
+    bool holdStill = (missionState == mission_land || missionState == mission_bob || missionState == mission_scan);
     
     if (!holdStill)
     {
         float factor = AVOID_VEL_MAX / AVOID_RADIUS;
 
-        float b_o = MAX(0.0f, AVOID_RADIUS - backRange);
-        float opp_o = goLeft ? MAX(0.0f, AVOID_RADIUS - rightRange)
-                            : MAX(0.0f, AVOID_RADIUS - leftRange);
+        float b_o     = MAX(0.0f, AVOID_RADIUS - backRange);
+        float front_o = MAX(0.0f, AVOID_RADIUS - frontRange);
 
-        float avoidX = b_o * factor;
+        // float opp_o = goLeft ? MAX(0.0f, AVOID_RADIUS - rightRange)
+        //                     : MAX(0.0f, AVOID_RADIUS - leftRange);
+
+        float opp_o = goLeft ? MAX(0.0f, AVOID_RADIUS - leftRange)
+                            : MAX(0.0f, AVOID_RADIUS - rightRange);
+
+        float avoidX = (b_o - front_o) * factor;   // back pushes forward, front pushes backward (braking)
         float avoidY = goLeft ? (-opp_o * factor) : (opp_o * factor);
 
-        float weight = MAX(b_o, opp_o) / AVOID_RADIUS;
+        float weight = MAX(MAX(b_o, front_o), opp_o) / AVOID_RADIUS;
         weight = MIN(weight, 1.0f);
 
         cmdVelX = (1.0f - weight) * cmdVelX + weight * avoidX;
         cmdVelY = (1.0f - weight) * cmdVelY + weight * avoidY;
     }
+
+    // if (!holdStill)
+    // {
+    //     float factor = AVOID_VEL_MAX / AVOID_RADIUS;
+
+    //     float b_o = MAX(0.0f, AVOID_RADIUS - backRange);
+    //     // float opp_o = goLeft ? MAX(0.0f, AVOID_RADIUS - rightRange)
+    //     //                     : MAX(0.0f, AVOID_RADIUS - leftRange);
+
+    //     float opp_o = goLeft ? MAX(0.0f, AVOID_RADIUS - leftRange)
+    //                  : MAX(0.0f, AVOID_RADIUS - rightRange);
+
+    //     float avoidX = b_o * factor;
+    //     float avoidY = goLeft ? (-opp_o * factor) : (opp_o * factor);
+
+    //     float weight = MAX(b_o, opp_o) / AVOID_RADIUS;
+    //     weight = MIN(weight, 1.0f);
+
+    //     cmdVelX = (1.0f - weight) * cmdVelX + weight * avoidX;
+    //     cmdVelY = (1.0f - weight) * cmdVelY + weight * avoidY;
+    // }
 
 
     // /* ===================== SMOOTH OBSTACLE AVOIDANCE (OLD) ===================== */
@@ -908,6 +934,20 @@ void appMain()
 
     // Smoothing to avoid oscillations
     static float prevX = 0, prevY = 0;  // 'static' ensures the value is remembered across loop iterations
+    
+    // Reset smoothing history when drone should be stationary
+    // if (missionState == mission_land || missionState == mission_bob)
+    // {
+    //     prevX = 0.0f;
+    //     prevY = 0.0f;
+    // }
+    if (missionState == mission_land || missionState == mission_bob ||
+        stateInnerLoop == rotateInCorner || stateInnerLoop == turnToFindWall)
+    {
+        prevX = 0.0f;
+        prevY = 0.0f;
+    }
+
     cmdVelX = 0.7f * prevX + 0.3f * cmdVelX;  // 70% old value + 30% new value
     cmdVelY = 0.7f * prevY + 0.3f * cmdVelY;  // 70% old value + 30% new value
     prevX = cmdVelX;
