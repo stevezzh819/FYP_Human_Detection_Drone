@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import pathlib
 import queue
 import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, Optional
 import sys
 
@@ -103,6 +105,109 @@ class RangeSnapshot:
     back: int = 32766
     up: int = 32766
     vbat: float = 0.0
+
+
+class TelemetryCsvLogger:
+    FIELDNAMES = [
+        "Time",
+        "uri",
+        "source",
+        "outer",
+        "mission",
+        "mission_name",
+        "shutter",
+        "human",
+        "human_fresh",
+        "human_stable",
+        "human_hold_s",
+        "human_confidence_pct",
+        "human_direction",
+        "human_max_temp_c",
+        "human_thermistor_c",
+        "flow_timestamp_ms",
+        "delta_x",
+        "delta_y",
+        "height_m",
+        "vel_x_mps",
+        "vel_y_mps",
+        "cmd_x_mps",
+        "cmd_y_mps",
+        "front_mm",
+        "left_mm",
+        "right_mm",
+        "back_mm",
+        "up_mm",
+        "vbat_v",
+    ]
+
+    def __init__(self, csv_dir: str, uri: str) -> None:
+        self.uri = uri
+        self.latest_mission = MissionSnapshot()
+        self.latest_flow = FlowSnapshot()
+        self.latest_range = RangeSnapshot()
+
+        safe_uri = "".join(ch if ch.isalnum() else "_" for ch in uri).strip("_") or "unknown_uri"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_dir = pathlib.Path(csv_dir).expanduser()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        self.path = base_dir / f"wall_follow_telemetry_{timestamp}_{safe_uri}.csv"
+        self._file = self.path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDNAMES)
+        self._writer.writeheader()
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.flush()
+        self._file.close()
+
+    def log_mission(self, snapshot: MissionSnapshot) -> None:
+        self.latest_mission = snapshot
+        self._write_row(source="mission")
+
+    def log_flow(self, snapshot: FlowSnapshot) -> None:
+        self.latest_flow = snapshot
+        self._write_row(source="flow")
+
+    def log_range(self, snapshot: RangeSnapshot) -> None:
+        self.latest_range = snapshot
+        self._write_row(source="range")
+
+    def _write_row(self, *, source: str) -> None:
+        now = time.time()
+        self._writer.writerow(
+            {
+                "Time": datetime.fromtimestamp(now).isoformat(timespec="milliseconds"),
+                "uri": self.uri,
+                "source": source,
+                "outer": self.latest_mission.outer,
+                "mission": self.latest_mission.mission,
+                "mission_name": MISSION_NAMES.get(self.latest_mission.mission, str(self.latest_mission.mission)),
+                "height_m": self.latest_mission.z,
+                "human": self.latest_mission.human,
+                "human_fresh": self.latest_mission.fresh,
+                "human_stable": self.latest_mission.stable,
+                "human_hold_s": self.latest_mission.hold,
+                "human_confidence_pct": self.latest_mission.conf,
+                "human_direction": self.latest_mission.direction,
+                "human_max_temp_c": self.latest_mission.max_temp_c,
+                "human_thermistor_c": self.latest_mission.therm_c,
+                "flow_timestamp_ms": self.latest_flow.timestamp_ms,
+                "delta_x": self.latest_flow.delta_x,
+                "delta_y": self.latest_flow.delta_y,
+                "shutter": self.latest_flow.shutter,
+                "vel_x_mps": self.latest_flow.vel_x,
+                "vel_y_mps": self.latest_flow.vel_y,
+                "cmd_x_mps": self.latest_flow.cmd_x,
+                "cmd_y_mps": self.latest_flow.cmd_y,
+                "front_mm": self.latest_range.front,
+                "left_mm": self.latest_range.left,
+                "right_mm": self.latest_range.right,
+                "back_mm": self.latest_range.back,
+                "up_mm": self.latest_range.up,
+                "vbat_v": self.latest_range.vbat,
+            }
+        )
+        self._file.flush()
 
 
 class ColorButton(tk.Label):
@@ -223,12 +328,14 @@ class RadioSession(threading.Thread):
         self,
         preferred_uri: Optional[str],
         cache_dir: str,
+        csv_dir: str,
         log_period_ms: int,
         event_queue: "queue.Queue[tuple[str, Dict[str, object]]]",
     ) -> None:
         super().__init__(name="cf-radio-session", daemon=True)
         self.preferred_uri = preferred_uri
         self.cache_dir = cache_dir
+        self.csv_dir = csv_dir
         self.log_period_ms = log_period_ms
         self.event_queue = event_queue
         self.command_queue: "queue.Queue[tuple[str, Optional[int]]]" = queue.Queue()
@@ -262,6 +369,7 @@ class RadioSession(threading.Thread):
 
         cf = Crazyflie(rw_cache=self.cache_dir)
         self.cf = cf
+        csv_logger: Optional[TelemetryCsvLogger] = None
         logconfs: list[LogConfig] = []
         line_buffer: list[str] = []
 
@@ -279,8 +387,7 @@ class RadioSession(threading.Thread):
             self._emit("status", level="error", message=f"{logconf.name}: {message}")
 
         def on_mission(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
-            self._emit(
-                "mission",
+            snapshot = MissionSnapshot(
                 timestamp_ms=ts,
                 outer=int(data["app.stateOuter"]),
                 mission=int(data["app.mission"]),
@@ -294,10 +401,12 @@ class RadioSession(threading.Thread):
                 max_temp_c=int(data["app.humanMax"]) / 100.0,
                 therm_c=int(data["app.humanTherm"]) / 100.0,
             )
+            if csv_logger is not None:
+                csv_logger.log_mission(snapshot)
+            self._emit("mission", **snapshot.__dict__)
 
         def on_flow(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
-            self._emit(
-                "flow",
+            snapshot = FlowSnapshot(
                 timestamp_ms=ts,
                 delta_x=int(data["motion.deltaX"]),
                 delta_y=int(data["motion.deltaY"]),
@@ -307,10 +416,12 @@ class RadioSession(threading.Thread):
                 cmd_x=float(data["app.cmdVelX"]),
                 cmd_y=float(data["app.cmdVelY"]),
             )
+            if csv_logger is not None:
+                csv_logger.log_flow(snapshot)
+            self._emit("flow", **snapshot.__dict__)
 
         def on_range(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
-            self._emit(
-                "range",
+            snapshot = RangeSnapshot(
                 timestamp_ms=ts,
                 front=int(data["range.front"]),
                 left=int(data["range.left"]),
@@ -319,6 +430,9 @@ class RadioSession(threading.Thread):
                 up=int(data["range.up"]),
                 vbat=float(data["pm.vbat"]),
             )
+            if csv_logger is not None:
+                csv_logger.log_range(snapshot)
+            self._emit("range", **snapshot.__dict__)
 
         def set_active_with_retry(active: int) -> None:
             last_error: Optional[Exception] = None
@@ -344,6 +458,11 @@ class RadioSession(threading.Thread):
         try:
             with SyncCrazyflie(uri, cf=cf) as scf:
                 scf.wait_for_params()
+                try:
+                    csv_logger = TelemetryCsvLogger(self.csv_dir, uri)
+                    self._emit("status", level="info", message=f"CSV telemetry logging to {csv_logger.path}")
+                except Exception as exc:
+                    self._emit("status", level="error", message=f"Failed to start CSV telemetry logging: {exc}")
 
                 mission_cfg = LogConfig(name="mission", period_in_ms=self.log_period_ms)
                 mission_cfg.add_variable("app.stateOuter", "uint8_t")
@@ -415,6 +534,12 @@ class RadioSession(threading.Thread):
             for cfg in logconfs:
                 try:
                     cfg.stop()
+                except Exception:
+                    pass
+
+            if csv_logger is not None:
+                try:
+                    csv_logger.close()
                 except Exception:
                     pass
 
@@ -921,6 +1046,7 @@ class DashboardApp:
         self.worker = RadioSession(
             preferred_uri=preferred_uri,
             cache_dir=self.args.cache,
+            csv_dir=self.args.csv_dir,
             log_period_ms=self.args.log_period_ms,
             event_queue=self.event_queue,
         )
@@ -1020,6 +1146,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tk dashboard for the Crazyflie wall-follow mission")
     parser.add_argument("--uri", help="Crazyflie link URI. Defaults to usb://0.")
     parser.add_argument("--cache", default="/Users/zhangzehua/Desktop/fyp/cache", help="TOC cache directory")
+    parser.add_argument(
+        "--csv-dir",
+        default=str(SCRIPT_DIR / "telemetry_logs"),
+        help="Directory where realtime telemetry CSV files will be written",
+    )
     parser.add_argument("--log-period-ms", type=int, default=250, help="Telemetry log period in ms")
     parser.add_argument("--no-auto-connect", dest="auto_connect", action="store_false", help="Open the window without connecting immediately")
     parser.set_defaults(auto_connect=True)
