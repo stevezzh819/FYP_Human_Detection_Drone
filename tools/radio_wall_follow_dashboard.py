@@ -801,6 +801,7 @@ class DashboardApp:
         self.range = RangeSnapshot()
         self.trace_points: list[tuple[float, float, float]] = []
         self.trace_active = False
+        self.show_trace_position = False
         self.path_breath_phase = 0.0
         self.sfx_player = SoundEffectPlayer()
         self.beep_sound_path = SCRIPT_DIR / "sound" / "beep.wav"
@@ -811,7 +812,7 @@ class DashboardApp:
         self.trace_session_token: Optional[str] = None
         self.trace_session_uri: Optional[str] = None
         self.trace_exported = False
-        self.stop_capture_delay_ms = 8000
+        self.stop_capture_delay_ms = 3000.     # Time after mission stop to keep capturing telemetry for trace export.
         self.trace_stop_after_id: Optional[str] = None
         self.latest_trace_html: Optional[pathlib.Path] = None
         self.console_lines: list[str] = []
@@ -991,6 +992,30 @@ class DashboardApp:
         )
         self.open_path_button.set_state("disabled")
         self.open_path_button.pack(side="right")
+        self.stop_trace_button = ColorButton(
+            getattr(self.path_frame, "_header_row"),
+            text="Stop",
+            command=self.stop_trace_capture,
+            bg="#252525",
+            fg="#ffffff",
+            active_bg="#1b1b1b",
+            active_fg="#ffffff",
+            width=8,
+            font=("Helvetica", 10, "bold"),
+        )
+        self.stop_trace_button.pack(side="right", padx=(0, 8))
+        self.clear_path_button = ColorButton(
+            getattr(self.path_frame, "_header_row"),
+            text="Clear",
+            command=self.clear_trace_dashboard,
+            bg="#252525",
+            fg="#ffffff",
+            active_bg="#1b1b1b",
+            active_fg="#ffffff",
+            width=8,
+            font=("Helvetica", 10, "bold"),
+        )
+        self.clear_path_button.pack(side="right", padx=(0, 8))
         self._build_path_panel()
 
         self.flow_frame = self._panel(cards, "Flow")
@@ -1131,6 +1156,7 @@ class DashboardApp:
         self._export_trace_image_if_needed()
         self.trace_points = []
         self.trace_active = True
+        self.show_trace_position = True
         self.trace_session_token = datetime.now().strftime("%d_%H_%M_%S")
         self.trace_session_uri = self.uri_var.get().strip() or "unknown_uri"
         self.trace_exported = False
@@ -1179,6 +1205,10 @@ class DashboardApp:
         self.console_text.configure(state="disabled")
 
     def open_trace_html(self) -> None:
+        if not self.trace_points:
+            self._append_console("No trace points have been recorded for the current session yet")
+            return
+
         if self.trace_points and not self.trace_exported:
             self._export_trace_image_if_needed()
 
@@ -1214,6 +1244,7 @@ class DashboardApp:
         self.last_human_sound_snapshot = MissionSnapshot()
         self._cancel_trace_stop_timer()
         self.trace_active = False
+        self.show_trace_position = False
         self._export_trace_image_if_needed()
         self.connection_var.set("Disconnected")
         self.worker = None
@@ -1253,6 +1284,53 @@ class DashboardApp:
         self.trace_active = False
         self._export_trace_image_if_needed()
         self._append_console("Telemetry capture window closed")
+
+    def stop_trace_capture(self) -> None:
+        self._cancel_trace_stop_timer()
+        if self.worker and self.connected:
+            self.worker.request_capture_stop_after(0.0)
+
+        if not self.trace_active:
+            self._append_console("Trace capture is not active")
+            return
+
+        self.trace_active = False
+        self._export_trace_image_if_needed()
+        self._append_console("Trace capture stopped immediately")
+
+    def clear_trace_dashboard(self) -> None:
+        if self.trace_active or self.trace_stop_after_id is not None:
+            self._append_console("Cannot clear the flying path while a trace session is still active")
+            return
+
+        self.trace_points = []
+        self.show_trace_position = False
+        self.trace_exported = False
+        self.trace_session_token = None
+        self.trace_session_uri = None
+        self.latest_trace_html = None
+        self.open_path_button.set_state("disabled")
+        self.flow.pos_valid = 0
+        self.flow.pos_x_cm = 0.0
+        self.flow.pos_y_cm = 0.0
+        self.flow.pos_z_cm = 0.0
+        self._render_flow()
+        self._render_path()
+        self._append_console("Cleared flying path trace and mission-relative XY display")
+
+    def _unique_export_path(self, output_path: pathlib.Path) -> pathlib.Path:
+        if not output_path.exists():
+            return output_path
+
+        stem = output_path.stem
+        suffix = output_path.suffix
+        parent = output_path.parent
+        counter = 1
+        while True:
+            candidate = parent / f"{stem}_{counter}{suffix}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
 
     def _play_human_sfx(self, previous: MissionSnapshot, current: MissionSnapshot) -> None:
         if not self.connected:
@@ -1410,13 +1488,18 @@ class DashboardApp:
         canvas.create_oval(head_x - head_r, head_y - head_r, head_x + head_r, head_y + head_r, fill="#ff3b30", outline="#ffd4ce", width=1)
 
     def _export_trace_image_if_needed(self) -> None:
-        if self.trace_exported or not self.trace_points:
+        if self.trace_exported:
+            return
+
+        if not self.trace_points:
+            if self.trace_session_token is not None:
+                self._append_console("No trace points were recorded; skipping path export")
             return
 
         timestamp = self.trace_session_token or datetime.now().strftime("%d_%H_%M_%S")
         self.trace_output_dir.mkdir(parents=True, exist_ok=True)
-        image_path = self.trace_output_dir / f"PathOverview_{timestamp}_Log.jpg"
-        html_path = self.trace_output_dir / f"3DPlot_{timestamp}.html"
+        image_path = self._unique_export_path(self.trace_output_dir / f"PathOverview_{timestamp}_Log.jpg")
+        html_path = self._unique_export_path(self.trace_output_dir / f"3DPlot_{timestamp}.html")
         image_saved = self._save_path_image(image_path)
         html_saved = self._save_path_html(html_path)
         self.trace_exported = image_saved and html_saved
@@ -1442,44 +1525,49 @@ class DashboardApp:
         height = 900
         scene = self._build_path_scene(width, height)
         if scene is None:
-            return
+            return False
 
-        image = Image.new("RGBA", (width, height), PALETTE["canvas_bg"])
-        draw = ImageDraw.Draw(image, "RGBA")
+        try:
+            image = Image.new("RGBA", (width, height), PALETTE["canvas_bg"])
+            draw = ImageDraw.Draw(image, "RGBA")
 
-        draw.polygon(scene["floor_polygon"], fill=(16, 16, 16, 255), outline=(27, 27, 27, 255))
+            draw.polygon(scene["floor_polygon"], fill=(16, 16, 16, 255), outline=(27, 27, 27, 255))
 
-        start_shadow = scene["start_shadow"]
-        draw.line([start_shadow, scene["x_axis"]], fill=(80, 80, 80, 150), width=4)
-        draw.line([start_shadow, scene["y_axis"]], fill=(80, 80, 80, 150), width=4)
-        draw.line([start_shadow, scene["z_axis"]], fill=(64, 64, 64, 170), width=4)
-        draw.text((start_shadow[0] + 14, start_shadow[1] + 14), "START", fill=(138, 138, 138, 220))
-        draw.text((scene["x_axis_label"][0] + 12, scene["x_axis_label"][1] + 2), "X", fill=(150, 150, 150, 120))
-        draw.text((scene["y_axis_label"][0] + 12, scene["y_axis_label"][1] + 2), "Y", fill=(150, 150, 150, 120))
+            start_shadow = scene["start_shadow"]
+            draw.line([start_shadow, scene["x_axis"]], fill=(80, 80, 80, 150), width=4)
+            draw.line([start_shadow, scene["y_axis"]], fill=(80, 80, 80, 150), width=4)
+            draw.line([start_shadow, scene["z_axis"]], fill=(64, 64, 64, 170), width=4)
+            draw.text((start_shadow[0] + 14, start_shadow[1] + 14), "START", fill=(138, 138, 138, 220))
+            draw.text((scene["x_axis_label"][0] + 12, scene["x_axis_label"][1] + 2), "X", fill=(150, 150, 150, 120))
+            draw.text((scene["y_axis_label"][0] + 12, scene["y_axis_label"][1] + 2), "Y", fill=(150, 150, 150, 120))
 
-        shadow_points = scene["shadow_points"]
-        path_points = scene["path_points"]
-        if len(shadow_points) >= 2:
-            draw.line(shadow_points, fill=(58, 36, 23, 220), width=16)
+            shadow_points = scene["shadow_points"]
+            path_points = scene["path_points"]
+            if len(shadow_points) >= 2:
+                draw.line(shadow_points, fill=(58, 36, 23, 220), width=16)
 
-        step = max(1, len(path_points) // 10)
-        for idx in range(step, len(path_points), step):
-            draw.line([shadow_points[idx], path_points[idx]], fill=(74, 56, 45, 180), width=2)
+            step = max(1, len(path_points) // 10)
+            for idx in range(step, len(path_points), step):
+                draw.line([shadow_points[idx], path_points[idx]], fill=(74, 56, 45, 180), width=2)
 
-        if len(path_points) >= 2:
-            draw.line(path_points, fill=(252, 76, 2, 255), width=9)
+            if len(path_points) >= 2:
+                draw.line(path_points, fill=(252, 76, 2, 255), width=9)
 
-        head_x, head_y = path_points[-1]
-        shadow_x, shadow_y = shadow_points[-1]
-        draw.line([(shadow_x, shadow_y), (head_x, head_y)], fill=(109, 75, 58, 220), width=3)
-        draw.ellipse((head_x - 26, head_y - 26, head_x + 26, head_y + 26), outline=(255, 138, 117, 160), width=4)
-        draw.ellipse((head_x - 16, head_y - 16, head_x + 16, head_y + 16), outline=(255, 90, 79, 220), width=5)
-        draw.ellipse((head_x - 9, head_y - 9, head_x + 9, head_y + 9), fill=(255, 59, 48, 255), outline=(255, 212, 206, 255), width=2)
+            head_x, head_y = path_points[-1]
+            shadow_x, shadow_y = shadow_points[-1]
+            draw.line([(shadow_x, shadow_y), (head_x, head_y)], fill=(109, 75, 58, 220), width=3)
+            draw.ellipse((head_x - 26, head_y - 26, head_x + 26, head_y + 26), outline=(255, 138, 117, 160), width=4)
+            draw.ellipse((head_x - 16, head_y - 16, head_x + 16, head_y + 16), outline=(255, 90, 79, 220), width=5)
+            draw.ellipse((head_x - 9, head_y - 9, head_x + 9, head_y + 9), fill=(255, 59, 48, 255), outline=(255, 212, 206, 255), width=2)
 
-        image.convert("RGB").save(output_path, format="JPEG", quality=92)
+            image.convert("RGB").save(output_path, format="JPEG", quality=92)
+        except Exception as exc:
+            self._append_console(f"WARNING: Flying path image export failed: {exc}")
+            return False
         return output_path.exists()
 
     def _save_path_html(self, output_path: pathlib.Path) -> bool:
+        global PLOTLY_IMPORT_ERROR
         plotly_go = ensure_plotly()
         if plotly_go is None or not self.trace_points:
             return False
@@ -1552,7 +1640,11 @@ class DashboardApp:
             margin={"l": 0, "r": 0, "t": 50, "b": 0},
             legend={"orientation": "h", "yanchor": "bottom", "y": 0.98, "xanchor": "right", "x": 1.0},
         )
-        fig.write_html(str(output_path), include_plotlyjs=True, full_html=True)
+        try:
+            fig.write_html(str(output_path), include_plotlyjs=True, full_html=True)
+        except Exception as exc:
+            PLOTLY_IMPORT_ERROR = str(exc)
+            return False
         return output_path.exists()
 
     def _animate_path_head(self) -> None:
@@ -1745,7 +1837,7 @@ class DashboardApp:
         self.shutter_value.configure(text=str(self.flow.shutter))
         self.vel_value.configure(text=f"({self.flow.vel_x:.2f}, {self.flow.vel_y:.2f}) m/s")
         self.cmd_value.configure(text=f"({self.flow.cmd_x:.2f}, {self.flow.cmd_y:.2f}) m/s")
-        if self.flow.pos_valid:
+        if self.show_trace_position and self.flow.pos_valid:
             self.pos_x_value.configure(text=f"{self.flow.pos_x_cm:.1f} cm")
             self.pos_y_value.configure(text=f"{self.flow.pos_y_cm:.1f} cm")
         else:
