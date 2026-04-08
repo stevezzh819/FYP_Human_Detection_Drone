@@ -91,7 +91,7 @@ static const float AVOID_RADIUS = 0.5f;
 // static const float AVOID_VEL_MAX = 0.1f;  // max avoidance velocity
 static const float AVOID_VEL_MAX = 0.3f;  // max avoidance velocity
 
-static const float VEL_CLAMP = 0.3f;
+static const float VEL_CLAMP = 0.25f;
 
 // ===================== Wall follow parameters =====================
 
@@ -265,13 +265,13 @@ static uint8_t getDashboardMissionState(MissionState state)
   case mission_approach:
     return 3U;
   case mission_bob:
-    return 3U;
-  case mission_land:
     return 4U;
-  case mission_transition:
+  case mission_land:
     return 5U;
-  case mission_align:
+  case mission_transition:
     return 6U;
+  case mission_align:
+    return 7U;
   }
 
   return 0U;
@@ -1053,7 +1053,7 @@ void appMain()
 
     
     /* ===================== SMOOTH OBSTACLE AVOIDANCE (NEW: Only uses right and back sensor. Front and left sensors will be used from wallFollower() library automatically) ===================== */
-    bool holdStill = (missionState == mission_land || missionState == mission_bob || missionState == mission_scan || missionState == mission_align);
+    bool holdStill = ( missionState == mission_bob || missionState == mission_scan || missionState == mission_align);
     
     if (!holdStill)
     {

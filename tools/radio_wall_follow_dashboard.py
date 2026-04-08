@@ -30,10 +30,13 @@ except ImportError:
     Image = None
     ImageDraw = None
 
+PLOTLY_IMPORT_ERROR: Optional[str] = None
+
 try:
     import plotly.graph_objects as go
-except ImportError:
+except Exception as exc:
     go = None
+    PLOTLY_IMPORT_ERROR = str(exc)
 
 try:
     from playsound import playsound as playsound_fn
@@ -69,6 +72,24 @@ DIR_NAMES = {
     0: "Center",
     1: "Right",
 }
+
+
+def ensure_plotly():
+    global go
+    global PLOTLY_IMPORT_ERROR
+
+    if go is not None:
+        return go
+
+    try:
+        import plotly.graph_objects as plotly_go
+    except Exception as exc:
+        PLOTLY_IMPORT_ERROR = str(exc)
+        return None
+
+    go = plotly_go
+    PLOTLY_IMPORT_ERROR = None
+    return go
 
 PALETTE = {
     "app_bg": "#080808",
@@ -174,11 +195,10 @@ class TelemetryCsvLogger:
         self.latest_flow = FlowSnapshot()
         self.latest_range = RangeSnapshot()
 
-        safe_uri = "".join(ch if ch.isalnum() else "_" for ch in uri).strip("_") or "unknown_uri"
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%d_%H_%M_%S")
         base_dir = pathlib.Path(csv_dir).expanduser()
         base_dir.mkdir(parents=True, exist_ok=True)
-        self.path = base_dir / f"wall_follow_telemetry_{timestamp}_{safe_uri}.csv"
+        self.path = base_dir / f"Log_{timestamp}.csv"
         self._file = self.path.open("w", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDNAMES)
         self._writer.writeheader()
@@ -795,8 +815,9 @@ class DashboardApp:
         self.trace_stop_after_id: Optional[str] = None
         self.latest_trace_html: Optional[pathlib.Path] = None
         self.console_lines: list[str] = []
-        self.uri_var = tk.StringVar(value=args.uri or "usb://0")
-        self.status_var = tk.StringVar(value="Waiting to connect")
+        initial_uri = args.uri.strip() if args.uri else ""
+        self.uri_var = tk.StringVar(value=initial_uri)
+        self.status_var = tk.StringVar(value="Press Scan to discover a Crazyflie or enter a URI")
         self.connection_var = tk.StringVar(value="Disconnected")
 
         self._configure_root()
@@ -807,7 +828,7 @@ class DashboardApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(60, self._pump_events)
         self.root.after(80, self._animate_path_head)
-        if self.args.auto_connect:
+        if self.args.auto_connect and initial_uri:
             self.root.after(150, self.connect)
 
     def _configure_root(self) -> None:
@@ -1110,7 +1131,7 @@ class DashboardApp:
         self._export_trace_image_if_needed()
         self.trace_points = []
         self.trace_active = True
-        self.trace_session_token = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.trace_session_token = datetime.now().strftime("%d_%H_%M_%S")
         self.trace_session_uri = self.uri_var.get().strip() or "unknown_uri"
         self.trace_exported = False
         self._render_path()
@@ -1392,25 +1413,30 @@ class DashboardApp:
         if self.trace_exported or not self.trace_points:
             return
 
-        safe_uri = "".join(ch if ch.isalnum() else "_" for ch in (self.trace_session_uri or "unknown_uri")).strip("_") or "unknown_uri"
-        timestamp = self.trace_session_token or datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = self.trace_session_token or datetime.now().strftime("%d_%H_%M_%S")
         self.trace_output_dir.mkdir(parents=True, exist_ok=True)
-        image_path = self.trace_output_dir / f"wall_follow_path_{timestamp}_{safe_uri}.jpg"
-        html_path = self.trace_output_dir / f"wall_follow_path_3d_{timestamp}_{safe_uri}.html"
-        self._save_path_image(image_path)
-        self._save_path_html(html_path)
-        self.trace_exported = True
-        if go is not None and html_path.exists():
+        image_path = self.trace_output_dir / f"PathOverview_{timestamp}_Log.jpg"
+        html_path = self.trace_output_dir / f"3DPlot_{timestamp}.html"
+        image_saved = self._save_path_image(image_path)
+        html_saved = self._save_path_html(html_path)
+        self.trace_exported = image_saved and html_saved
+        if html_saved:
             self.latest_trace_html = html_path
             self.open_path_button.set_state("normal")
-        if Image is not None and ImageDraw is not None:
+        else:
+            self.latest_trace_html = None
+            self.open_path_button.set_state("disabled")
+        if image_saved:
             self._append_console(f"Saved flying path image to {image_path}")
-        if go is not None:
+        if html_saved:
             self._append_console(f"Saved interactive 3D path to {html_path}")
+        elif image_saved:
+            reason = PLOTLY_IMPORT_ERROR or "Plotly export did not create an HTML file"
+            self._append_console(f"WARNING: 3D HTML path export skipped: {reason}")
 
-    def _save_path_image(self, output_path: pathlib.Path) -> None:
+    def _save_path_image(self, output_path: pathlib.Path) -> bool:
         if Image is None or ImageDraw is None:
-            return
+            return False
 
         width = 1280
         height = 900
@@ -1451,18 +1477,20 @@ class DashboardApp:
         draw.ellipse((head_x - 9, head_y - 9, head_x + 9, head_y + 9), fill=(255, 59, 48, 255), outline=(255, 212, 206, 255), width=2)
 
         image.convert("RGB").save(output_path, format="JPEG", quality=92)
+        return output_path.exists()
 
-    def _save_path_html(self, output_path: pathlib.Path) -> None:
-        if go is None or not self.trace_points:
-            return
+    def _save_path_html(self, output_path: pathlib.Path) -> bool:
+        plotly_go = ensure_plotly()
+        if plotly_go is None or not self.trace_points:
+            return False
 
         xs = [point[0] for point in self.trace_points]
         ys = [point[1] for point in self.trace_points]
         zs = [point[2] for point in self.trace_points]
 
-        fig = go.Figure()
+        fig = plotly_go.Figure()
         fig.add_trace(
-            go.Scatter3d(
+            plotly_go.Scatter3d(
                 x=xs,
                 y=ys,
                 z=zs,
@@ -1472,7 +1500,7 @@ class DashboardApp:
             )
         )
         fig.add_trace(
-            go.Scatter3d(
+            plotly_go.Scatter3d(
                 x=[xs[-1]],
                 y=[ys[-1]],
                 z=[zs[-1]],
@@ -1482,7 +1510,7 @@ class DashboardApp:
             )
         )
         fig.add_trace(
-            go.Scatter3d(
+            plotly_go.Scatter3d(
                 x=[0.0],
                 y=[0.0],
                 z=[0.0],
@@ -1525,6 +1553,7 @@ class DashboardApp:
             legend={"orientation": "h", "yanchor": "bottom", "y": 0.98, "xanchor": "right", "x": 1.0},
         )
         fig.write_html(str(output_path), include_plotlyjs=True, full_html=True)
+        return output_path.exists()
 
     def _animate_path_head(self) -> None:
         self.path_breath_phase += 0.35
@@ -1744,7 +1773,7 @@ class DashboardApp:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tk dashboard for the Crazyflie wall-follow mission")
-    parser.add_argument("--uri", help="Crazyflie link URI. Defaults to usb://0.")
+    parser.add_argument("--uri", help="Crazyflie link URI. If omitted, the dashboard starts disconnected and waits for Scan or manual entry.")
     parser.add_argument("--cache", default="/Users/zhangzehua/Desktop/fyp/cache", help="TOC cache directory")
     parser.add_argument(
         "--csv-dir",
@@ -1752,7 +1781,7 @@ def parse_args() -> argparse.Namespace:
         help="Directory where realtime telemetry CSV files will be written",
     )
     parser.add_argument("--log-period-ms", type=int, default=250, help="Telemetry log period in ms")
-    parser.add_argument("--no-auto-connect", dest="auto_connect", action="store_false", help="Open the window without connecting immediately")
+    parser.add_argument("--no-auto-connect", dest="auto_connect", action="store_false", help="Open the window without auto-connecting when --uri is provided")
     parser.set_defaults(auto_connect=True)
     return parser.parse_args()
 

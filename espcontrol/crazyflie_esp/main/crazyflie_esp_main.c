@@ -178,7 +178,7 @@ static bool is_human_1m(const blob_stats_t *b, float amb)
 
     if (tmax < amb + 3.0f) return false;
     if (mean < amb + 2.0f) return false;
-    if (tmax > 33.0f || tmax < 23.0f) return false;
+    if (tmax > 33.0f || tmax < 24.5f) return false;
     if (b->size < 15) return false;
     if (b->size > 50) return false;
     if (std <= 0.45f) return false;
