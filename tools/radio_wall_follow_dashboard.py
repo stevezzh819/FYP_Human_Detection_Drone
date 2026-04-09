@@ -812,7 +812,7 @@ class DashboardApp:
         self.trace_session_token: Optional[str] = None
         self.trace_session_uri: Optional[str] = None
         self.trace_exported = False
-        self.stop_capture_delay_ms = 3000.     # Time after mission stop to keep capturing telemetry for trace export.
+        self.stop_capture_delay_ms: int = 3000  # Time after mission stop to keep capturing telemetry for trace export.
         self.trace_stop_after_id: Optional[str] = None
         self.latest_trace_html: Optional[pathlib.Path] = None
         self.console_lines: list[str] = []
@@ -1060,11 +1060,16 @@ class DashboardApp:
         body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
         flags_row = tk.Frame(body, bg=PALETTE["panel_bg"])
-        flags_row.pack(anchor="w", pady=(0, 10))
+        flags_row.pack(fill="x", pady=(0, 10))
         self.fresh_value = tk.Label(flags_row, text="Fresh: --", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11))
         self.fresh_value.pack(side="left")
         self.stable_value = tk.Label(flags_row, text="Stable: --", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11))
         self.stable_value.pack(side="left", padx=(20, 0))
+        self.uart_status_label = tk.Label(flags_row, text="UART", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11, "bold"))
+        self.uart_status_label.pack(side="right", padx=(8, 0))
+        self.uart_status_canvas = tk.Canvas(flags_row, width=16, height=16, bg=PALETTE["panel_bg"], highlightthickness=0)
+        self.uart_status_canvas.pack(side="right")
+        self.uart_status_canvas.create_rectangle(2, 2, 14, 14, fill="#d93025", outline=PALETTE["text_muted"], width=1, tags="uart_led")
 
         self.human_led_canvas = tk.Canvas(body, width=180, height=180, bg=PALETTE["panel_bg"], highlightthickness=0)
         self.human_led_canvas.pack(pady=(6, 12))
@@ -1179,7 +1184,7 @@ class DashboardApp:
             return
         self._cancel_trace_stop_timer()
         if self.trace_active:
-            self.trace_stop_after_id = self.root.after(self.stop_capture_delay_ms, self._finish_trace_capture_window)
+            self.trace_stop_after_id = self.root.after(int(self.stop_capture_delay_ms), self._finish_trace_capture_window)
         self.worker.request_capture_stop_after(self.stop_capture_delay_ms / 1000.0)
         self.worker.request_active(False)
         self._append_console("Stop button pressed; capture will stop after landing window")
@@ -1829,6 +1834,8 @@ class DashboardApp:
         self.human_led_canvas.itemconfigure("led_text", text=human_text)
         self.fresh_value.configure(text=f"Fresh: {self.mission.fresh}")
         self.stable_value.configure(text=f"Stable: {self.mission.stable}")
+        uart_color = "#34c82a" if self.mission.fresh else "#d93025"
+        self.uart_status_canvas.itemconfigure("uart_led", fill=uart_color)
         self.max_temp_value.configure(text=f"Max Temp: {self.mission.max_temp_c:.2f} C")
         self.therm_value.configure(text=f"Thermistor: {self.mission.therm_c:.2f} C")
 
