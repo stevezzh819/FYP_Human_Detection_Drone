@@ -489,6 +489,17 @@ class RadioSession(threading.Thread):
         origin_world_y: Optional[float] = None
         origin_world_z: Optional[float] = None
         origin_yaw_deg: Optional[float] = None
+        mission_outer_var: Optional[str] = None
+        mission_state_var: Optional[str] = None
+        mission_human_var: Optional[str] = None
+        mission_conf_var: Optional[str] = None
+        mission_dir_var: Optional[str] = None
+        mission_fresh_var: Optional[str] = None
+        mission_stable_var: Optional[str] = None
+        mission_hold_var: Optional[str] = None
+        mission_max_var: Optional[str] = None
+        mission_therm_var: Optional[str] = None
+        mission_z_var: Optional[str] = None
 
         def on_console(chars: str) -> None:
             for ch in chars:
@@ -503,20 +514,34 @@ class RadioSession(threading.Thread):
         def on_log_error(logconf: LogConfig, message: str) -> None:
             self._emit("status", level="error", message=f"{logconf.name}: {message}")
 
+        def log_var_exists(complete_name: str) -> bool:
+            if "." not in complete_name:
+                return False
+            if cf.log.toc is None:
+                return False
+            group, name = complete_name.split(".", 1)
+            return cf.log.toc.get_element(group, name) is not None
+
+        def choose_log_var(*candidates: str) -> Optional[str]:
+            for candidate in candidates:
+                if log_var_exists(candidate):
+                    return candidate
+            return None
+
         def on_mission(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
             snapshot = MissionSnapshot(
                 timestamp_ms=ts,
-                outer=int(data["app.stateOuter"]),
-                mission=int(data["app.mission"]),
-                human=int(data["app.human"]),
-                fresh=int(data["app.humanFresh"]),
-                stable=int(data["app.humanStable"]),
-                hold=float(data["app.humanHold"]),
-                conf=int(data["app.humanConf"]),
-                direction=int(data["app.humanDir"]),
-                z=float(data["stateEstimate.z"]),
-                max_temp_c=int(data["app.humanMax"]) / 100.0,
-                therm_c=int(data["app.humanTherm"]) / 100.0,
+                outer=int(data.get(mission_outer_var, 0)) if mission_outer_var else 0,
+                mission=int(data.get(mission_state_var, 0)) if mission_state_var else 0,
+                human=int(data.get(mission_human_var, 0)) if mission_human_var else 0,
+                fresh=int(data.get(mission_fresh_var, 0)) if mission_fresh_var else 0,
+                stable=int(data.get(mission_stable_var, 0)) if mission_stable_var else 0,
+                hold=float(data.get(mission_hold_var, 0.0)) if mission_hold_var else 0.0,
+                conf=int(data.get(mission_conf_var, 0)) if mission_conf_var else 0,
+                direction=int(data.get(mission_dir_var, 0)) if mission_dir_var else 0,
+                z=float(data.get(mission_z_var, 0.0)) if mission_z_var else 0.0,
+                max_temp_c=(int(data.get(mission_max_var, 0)) / 100.0) if mission_max_var else 0.0,
+                therm_c=(int(data.get(mission_therm_var, 0)) / 100.0) if mission_therm_var else 0.0,
             )
             if csv_logger is not None and capture_enabled_now():
                 csv_logger.log_mission(snapshot)
@@ -629,27 +654,59 @@ class RadioSession(threading.Thread):
         try:
             with SyncCrazyflie(uri, cf=cf) as scf:
                 scf.wait_for_params()
+                mission_outer_var = choose_log_var("app.stateOuterLoop", "app.stateOuter")
+                mission_state_var = choose_log_var("app.missionState", "app.mission")
+                mission_human_var = choose_log_var("app.humanDetected", "app.human")
+                mission_conf_var = choose_log_var("app.humanConf")
+                mission_dir_var = choose_log_var("app.humanDir")
+                mission_fresh_var = choose_log_var("app.humanFresh")
+                mission_stable_var = choose_log_var("app.humanStable")
+                mission_hold_var = choose_log_var("app.humanHold")
+                mission_max_var = choose_log_var("app.humanMax")
+                mission_therm_var = choose_log_var("app.humanTherm")
+                mission_z_var = choose_log_var("stateEstimate.z")
                 try:
                     csv_logger = TelemetryCsvLogger(self.csv_dir, uri)
                     self._emit("status", level="info", message=f"CSV telemetry logging to {csv_logger.path}")
                 except Exception as exc:
                     self._emit("status", level="error", message=f"Failed to start CSV telemetry logging: {exc}")
 
+                active_logconfs: list[LogConfig] = []
+
                 mission_cfg = LogConfig(name="mission", period_in_ms=self.log_period_ms)
-                mission_cfg.add_variable("app.stateOuter", "uint8_t")
-                mission_cfg.add_variable("app.mission", "uint8_t")
-                mission_cfg.add_variable("app.human", "uint8_t")
-                mission_cfg.add_variable("app.humanConf", "uint8_t")
-                mission_cfg.add_variable("app.humanDir", "int8_t")
-                mission_cfg.add_variable("app.humanFresh", "uint8_t")
-                mission_cfg.add_variable("app.humanStable", "uint8_t")
-                mission_cfg.add_variable("app.humanHold", "float")
-                mission_cfg.add_variable("app.humanMax", "int16_t")
-                mission_cfg.add_variable("app.humanTherm", "int16_t")
-                mission_cfg.add_variable("stateEstimate.z", "float")
-                mission_cfg.data_received_cb.add_callback(on_mission)
-                mission_cfg.error_cb.add_callback(on_log_error)
-                cf.log.add_config(mission_cfg)
+                mission_log_vars = [
+                    (mission_outer_var, "uint8_t"),
+                    (mission_state_var, "uint8_t"),
+                    (mission_human_var, "uint8_t"),
+                    (mission_conf_var, "uint8_t"),
+                    (mission_dir_var, "int8_t"),
+                    (mission_fresh_var, "uint8_t"),
+                    (mission_stable_var, "uint8_t"),
+                    (mission_hold_var, "float"),
+                    (mission_max_var, "int16_t"),
+                    (mission_therm_var, "int16_t"),
+                    (mission_z_var, "float"),
+                ]
+                mission_var_names = [name for name, _ctype in mission_log_vars if name]
+                for var_name, ctype in mission_log_vars:
+                    if var_name:
+                        mission_cfg.add_variable(var_name, ctype)
+                if mission_var_names:
+                    mission_cfg.data_received_cb.add_callback(on_mission)
+                    mission_cfg.error_cb.add_callback(on_log_error)
+                    try:
+                        cf.log.add_config(mission_cfg)
+                    except Exception as exc:
+                        self._emit("status", level="warning", message=f"Skipping mission log block: {exc}")
+                    else:
+                        active_logconfs.append(mission_cfg)
+                        self._emit(
+                            "status",
+                            level="info",
+                            message=f"Mission log TOC matched: {', '.join(mission_var_names)}",
+                        )
+                else:
+                    self._emit("status", level="warning", message="No compatible mission log variables found in TOC; mission panel will stay default")
 
                 flow_cfg = LogConfig(name="flow", period_in_ms=self.log_period_ms)
                 flow_cfg.add_variable("motion.deltaX", "int16_t")
@@ -661,7 +718,12 @@ class RadioSession(threading.Thread):
                 flow_cfg.add_variable("app.cmdVelY", "float")
                 flow_cfg.data_received_cb.add_callback(on_flow)
                 flow_cfg.error_cb.add_callback(on_log_error)
-                cf.log.add_config(flow_cfg)
+                try:
+                    cf.log.add_config(flow_cfg)
+                except Exception as exc:
+                    self._emit("status", level="warning", message=f"Skipping flow log block: {exc}")
+                else:
+                    active_logconfs.append(flow_cfg)
 
                 pose_cfg = LogConfig(name="pose", period_in_ms=self.log_period_ms)
                 pose_cfg.add_variable("stateEstimate.x", "float")
@@ -670,7 +732,12 @@ class RadioSession(threading.Thread):
                 pose_cfg.add_variable("stabilizer.yaw", "float")
                 pose_cfg.data_received_cb.add_callback(on_pose)
                 pose_cfg.error_cb.add_callback(on_log_error)
-                cf.log.add_config(pose_cfg)
+                try:
+                    cf.log.add_config(pose_cfg)
+                except Exception as exc:
+                    self._emit("status", level="warning", message=f"Skipping pose log block: {exc}")
+                else:
+                    active_logconfs.append(pose_cfg)
 
                 range_cfg = LogConfig(name="range", period_in_ms=self.log_period_ms)
                 range_cfg.add_variable("range.front", "uint16_t")
@@ -681,11 +748,19 @@ class RadioSession(threading.Thread):
                 range_cfg.add_variable("pm.vbat", "float")
                 range_cfg.data_received_cb.add_callback(on_range)
                 range_cfg.error_cb.add_callback(on_log_error)
-                cf.log.add_config(range_cfg)
+                try:
+                    cf.log.add_config(range_cfg)
+                except Exception as exc:
+                    self._emit("status", level="warning", message=f"Skipping range log block: {exc}")
+                else:
+                    active_logconfs.append(range_cfg)
 
-                logconfs.extend([mission_cfg, flow_cfg, pose_cfg, range_cfg])
+                logconfs.extend(active_logconfs)
                 for cfg in logconfs:
-                    cfg.start()
+                    try:
+                        cfg.start()
+                    except Exception as exc:
+                        self._emit("status", level="warning", message=f"Failed to start {cfg.name} log block: {exc}")
 
                 cf.console.receivedChar.add_callback(on_console)
                 set_active_with_retry(0)
