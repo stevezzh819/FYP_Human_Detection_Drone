@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
+import json
 import math
 import pathlib
 import queue
@@ -1648,13 +1650,19 @@ class DashboardApp:
 
     def _save_path_html(self, output_path: pathlib.Path) -> bool:
         global PLOTLY_IMPORT_ERROR
-        plotly_go = ensure_plotly()
-        if plotly_go is None or not self.trace_points:
+        if not self.trace_points:
             return False
 
         xs = [point[0] for point in self.trace_points]
         ys = [point[1] for point in self.trace_points]
         zs = [point[2] for point in self.trace_points]
+
+        plotly_go = ensure_plotly()
+        if plotly_go is None:
+            append_console = getattr(self, "_append_console", None)
+            if callable(append_console):
+                append_console(f"WARNING: Plotly is unavailable, using built-in 3D HTML exporter: {PLOTLY_IMPORT_ERROR or 'unknown reason'}")
+            return self._save_path_html_fallback(output_path, xs, ys, zs, PLOTLY_IMPORT_ERROR or "Plotly is unavailable")
 
         fig = plotly_go.Figure()
         fig.add_trace(
@@ -1724,6 +1732,305 @@ class DashboardApp:
             fig.write_html(str(output_path), include_plotlyjs=True, full_html=True)
         except Exception as exc:
             PLOTLY_IMPORT_ERROR = str(exc)
+            append_console = getattr(self, "_append_console", None)
+            if callable(append_console):
+                append_console(f"WARNING: Plotly HTML export failed, using built-in fallback: {exc}")
+            return self._save_path_html_fallback(output_path, xs, ys, zs, str(exc))
+        return output_path.exists()
+
+    def _save_path_html_fallback(self,
+                                 output_path: pathlib.Path,
+                                 xs: list[float],
+                                 ys: list[float],
+                                 zs: list[float],
+                                 reason: str) -> bool:
+        if not xs or not ys or not zs:
+            return False
+
+        points = [[float(x), float(y), float(z)] for x, y, z in zip(xs, ys, zs)]
+        safe_reason = html.escape(reason or "unknown")
+        try:
+            output_path.write_text(
+                f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crazyflie Flying Path</title>
+  <style>
+    html, body {{
+      margin: 0;
+      height: 100%;
+      background: #080808;
+      color: #f5f5f5;
+      font-family: Helvetica, Arial, sans-serif;
+    }}
+    body {{
+      display: flex;
+      flex-direction: column;
+    }}
+    .topbar {{
+      padding: 12px 16px 8px 16px;
+      border-bottom: 1px solid #1f1f1f;
+      background: #101010;
+    }}
+    .title {{
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }}
+    .subtitle {{
+      font-size: 13px;
+      color: #b8b8b8;
+    }}
+    .fallback {{
+      margin-top: 6px;
+      font-size: 12px;
+      color: #8a8a8a;
+    }}
+    #viewport {{
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
+    }}
+    #viewport.dragging {{
+      cursor: grabbing;
+    }}
+    .footer {{
+      padding: 8px 16px 12px 16px;
+      font-size: 12px;
+      color: #8a8a8a;
+      border-top: 1px solid #1f1f1f;
+      background: #101010;
+    }}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="title">Crazyflie Flying Path</div>
+    <div class="subtitle">Built-in 3D exporter. Drag to rotate, mouse wheel to zoom.</div>
+    <div class="fallback">Fallback exporter used: {safe_reason}</div>
+  </div>
+  <canvas id="viewport"></canvas>
+  <div class="footer" id="stats"></div>
+  <script>
+    const points = {json.dumps(points)};
+    const canvas = document.getElementById("viewport");
+    const ctx = canvas.getContext("2d");
+    const stats = document.getElementById("stats");
+
+    let yaw = -0.95;
+    let pitch = 0.55;
+    let zoom = 1.0;
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
+
+    const ranges = {{
+      minX: Math.min(...points.map((p) => p[0]), 0),
+      maxX: Math.max(...points.map((p) => p[0]), 0),
+      minY: Math.min(...points.map((p) => p[1]), 0),
+      maxY: Math.max(...points.map((p) => p[1]), 0),
+      minZ: Math.min(...points.map((p) => p[2]), 0),
+      maxZ: Math.max(...points.map((p) => p[2]), 0),
+    }};
+
+    const center = {{
+      x: (ranges.minX + ranges.maxX) / 2,
+      y: (ranges.minY + ranges.maxY) / 2,
+      z: (ranges.minZ + ranges.maxZ) / 2,
+    }};
+
+    const spanX = Math.max(1, ranges.maxX - ranges.minX);
+    const spanY = Math.max(1, ranges.maxY - ranges.minY);
+    const spanZ = Math.max(1, ranges.maxZ - ranges.minZ);
+    const maxSpan = Math.max(spanX, spanY, spanZ);
+
+    function resize() {{
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      draw();
+    }}
+
+    function rotatePoint(px, py, pz) {{
+      const x0 = px - center.x;
+      const y0 = py - center.y;
+      const z0 = pz - center.z;
+
+      const cy = Math.cos(yaw);
+      const sy = Math.sin(yaw);
+      const cp = Math.cos(pitch);
+      const sp = Math.sin(pitch);
+
+      const x1 = x0 * cy - y0 * sy;
+      const y1 = x0 * sy + y0 * cy;
+      const z1 = z0;
+
+      return {{
+        x: x1,
+        y: y1 * cp - z1 * sp,
+        z: y1 * sp + z1 * cp,
+      }};
+    }}
+
+    function project(px, py, pz) {{
+      const r = rotatePoint(px, py, pz);
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      const scale = (Math.min(w, h) * 0.36 * zoom) / maxSpan;
+      const depth = 1.0 / (1.0 + Math.max(-2.5, Math.min(2.5, r.z / maxSpan)));
+      return {{
+        x: (w / 2) + r.x * scale * depth,
+        y: (h / 2) - r.y * scale * depth,
+        depth: r.z,
+      }};
+    }}
+
+    function drawAxes() {{
+      const axisLen = maxSpan * 0.35;
+      const origin = project(0, 0, 0);
+      const axisX = project(axisLen, 0, 0);
+      const axisY = project(0, axisLen, 0);
+      const axisZ = project(0, 0, axisLen);
+
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "rgba(160,160,160,0.55)";
+      ctx.beginPath();
+      ctx.moveTo(origin.x, origin.y);
+      ctx.lineTo(axisX.x, axisX.y);
+      ctx.moveTo(origin.x, origin.y);
+      ctx.lineTo(axisY.x, axisY.y);
+      ctx.moveTo(origin.x, origin.y);
+      ctx.lineTo(axisZ.x, axisZ.y);
+      ctx.stroke();
+
+      ctx.fillStyle = "rgba(200,200,200,0.9)";
+      ctx.font = "12px Helvetica";
+      ctx.fillText("START", origin.x + 8, origin.y + 14);
+      ctx.fillText("X", axisX.x + 6, axisX.y);
+      ctx.fillText("Y", axisY.x + 6, axisY.y);
+      ctx.fillText("Z", axisZ.x + 6, axisZ.y);
+    }}
+
+    function drawPath() {{
+      if (points.length < 1) {{
+        return;
+      }}
+
+      const projected = points.map((p) => project(p[0], p[1], p[2]));
+      const shadow = points.map((p) => project(p[0], p[1], 0));
+
+      if (shadow.length > 1) {{
+        ctx.strokeStyle = "rgba(90,55,35,0.55)";
+        ctx.lineWidth = 10;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(shadow[0].x, shadow[0].y);
+        for (const p of shadow.slice(1)) {{
+          ctx.lineTo(p.x, p.y);
+        }}
+        ctx.stroke();
+      }}
+
+      if (projected.length > 1) {{
+        ctx.strokeStyle = "#FC4C02";
+        ctx.lineWidth = 5;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(projected[0].x, projected[0].y);
+        for (const p of projected.slice(1)) {{
+          ctx.lineTo(p.x, p.y);
+        }}
+        ctx.stroke();
+      }}
+
+      const start = projected[0];
+      const current = projected[projected.length - 1];
+
+      ctx.fillStyle = "#9a9a9a";
+      ctx.beginPath();
+      ctx.arc(start.x, start.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = "rgba(255,138,117,0.75)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(current.x, current.y, 14, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.strokeStyle = "rgba(255,90,79,0.95)";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(current.x, current.y, 8, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = "#ff3b30";
+      ctx.beginPath();
+      ctx.arc(current.x, current.y, 4.5, 0, Math.PI * 2);
+      ctx.fill();
+    }}
+
+    function draw() {{
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "#080808";
+      ctx.fillRect(0, 0, w, h);
+      drawAxes();
+      drawPath();
+      stats.textContent = `Points: ${{points.length}}  |  X span: ${{spanX.toFixed(1)}} cm  |  Y span: ${{spanY.toFixed(1)}} cm  |  Z span: ${{spanZ.toFixed(1)}} cm`;
+    }}
+
+    canvas.addEventListener("mousedown", (event) => {{
+      dragging = true;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      canvas.classList.add("dragging");
+    }});
+
+    window.addEventListener("mouseup", () => {{
+      dragging = false;
+      canvas.classList.remove("dragging");
+    }});
+
+    window.addEventListener("mousemove", (event) => {{
+      if (!dragging) {{
+        return;
+      }}
+      const dx = event.clientX - lastX;
+      const dy = event.clientY - lastY;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      yaw += dx * 0.01;
+      pitch = Math.max(-1.25, Math.min(1.25, pitch + dy * 0.01));
+      draw();
+    }});
+
+    canvas.addEventListener("wheel", (event) => {{
+      event.preventDefault();
+      const scale = Math.exp(-event.deltaY * 0.001);
+      zoom = Math.max(0.35, Math.min(4.0, zoom * scale));
+      draw();
+    }}, {{ passive: false }});
+
+    window.addEventListener("resize", resize);
+    resize();
+  </script>
+</body>
+</html>
+""",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            append_console = getattr(self, "_append_console", None)
+            if callable(append_console):
+                append_console(f"WARNING: Built-in 3D HTML export failed: {exc}")
             return False
         return output_path.exists()
 
