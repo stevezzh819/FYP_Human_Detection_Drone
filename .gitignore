@@ -6,6 +6,8 @@
 **/dist/
 **/out/
 /tools/telemetry_logs
+/REPORT
+/output
 
 # Environment/config artifacts
 *.env
