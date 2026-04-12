@@ -10,7 +10,7 @@
 /output
 /cache
 /cache312
-
+/tools/.claude
 # Environment/config artifacts
 *.env
 .venv/
