@@ -8,6 +8,8 @@
 /tools/telemetry_logs
 /REPORT
 /output
+/cache
+/cache312
 
 # Environment/config artifacts
 *.env
