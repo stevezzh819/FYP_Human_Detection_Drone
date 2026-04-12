@@ -33,11 +33,6 @@ Main purpose:
 - Receives ESP32 human-detection data through UART
 - Exposes telemetry to the Python dashboard through Crazyflie logging / CRTP
 
-Important files:
-- `crazyflie/crazyflie-firmware/examples/demos/app_wall_following_demo/src/wall_following.c`
-- `crazyflie/crazyflie-firmware/src/modules/src/esp_uart_bridge.c`
-- `crazyflie/crazyflie-firmware/src/modules/interface/esp_uart_bridge.h`
-- `crazyflie/crazyflie-firmware/src/drivers/src/uart2.c`
 
 ### 2. ESP32 Firmware
 Location:
@@ -49,10 +44,6 @@ Main purpose:
 - Sends detection results to Crazyflie over UART
 - Can stream thermal frames to the desktop heatmap viewer over USB Serial/JTAG
 
-Important files:
-- `espcontrol/crazyflie_esp/main/crazyflie_esp_main.c`
-- `espcontrol/crazyflie_esp/main/amg8833.c`
-- `espcontrol/crazyflie_esp/main/uart_cf_comm.c`
 
 ### 3. Python Dashboard and Tools
 Location:
@@ -66,12 +57,6 @@ Main purpose:
 - Export 2D and 3D path visualizations
 - Open exported 3D path in a browser
 - Provide thermal debugging tools
-
-Important files:
-- `tools/radio_wall_follow_dashboard.py`
-- `tools/radio_wall_follow_mission.py`
-- `tools/amg8833_heatmap_viewer.py`
-- `tools/telemetry_logs/`
 
 ---
 ## Dashboard Requirements
