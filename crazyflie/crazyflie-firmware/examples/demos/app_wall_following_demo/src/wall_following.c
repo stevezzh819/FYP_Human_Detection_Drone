@@ -81,8 +81,8 @@ static const uint32_t HUMAN_PACKET_STALE_TIMEOUT_MS = 300U;  // Defines how long
 
 static const float HUMAN_CONFIRM_TIME = 3.0f;  // Param/Variable for Dashboard Reading
 
-// static const float BATTERY_CUTOFF = 2.8f;
 static const float BATTERY_CUTOFF = 2.5f;
+// static const float BATTERY_CUTOFF = 2.0f;
 
 // Push-style avoidance parameters
 // static const float AVOID_RADIUS = 0.4f;   // meters
@@ -91,7 +91,7 @@ static const float AVOID_RADIUS = 0.5f;
 // static const float AVOID_VEL_MAX = 0.1f;  // max avoidance velocity
 static const float AVOID_VEL_MAX = 0.3f;  // max avoidance velocity
 
-static const float VEL_CLAMP = 0.3f;
+static const float VEL_CLAMP = 0.25f;
 
 // ===================== Wall follow parameters =====================
 
@@ -1058,9 +1058,8 @@ void appMain()
 
     
     /* ===================== SMOOTH OBSTACLE AVOIDANCE (NEW: Only uses right and back sensor. Front and left sensors will be used from wallFollower() library automatically) ===================== */
-    // bool holdStill = (missionState == mission_land || missionState == mission_bob || missionState == mission_scan || missionState == mission_align);
-
-    bool holdStill = (missionState == mission_bob || missionState == mission_scan || missionState == mission_align);
+    bool holdStill = ( missionState == mission_bob || missionState == mission_scan || missionState == mission_align);
+    
     if (!holdStill)
     {
         // SGBA-style avoidance: fixed per-axis push when sensor is within save_distance.

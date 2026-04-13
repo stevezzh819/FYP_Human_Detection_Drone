@@ -172,7 +172,6 @@ static void debugHandler(xTimerHandle timer) {
 
   if (triggerDebugProbe) {
     triggerDebugProbe = 0;
-
     uartSyslinkDumpDebugProbe();
     DEBUG_PRINT("Syslink NRF debug probe initialized\n");
 

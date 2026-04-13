@@ -8,28 +8,17 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
-#include "driver/i2c_master.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
 #include "esp_err.h"
 
+#include "amg8833.h"
 #include "uart_cf_comm.h"
 
 #define I2C_SDA_PIN                  8
 #define I2C_SCL_PIN                  9
 #define I2C_FREQ                     400000
 #define AMG_ADDR                     0x69
-
-#define REG_PCTL                     0x00
-#define REG_RST                      0x01
-#define REG_FPSC                     0x02
-#define REG_TTHL                     0x0E
-#define REG_PXL                      0x80
-
-#define PCTL_NORMAL                  0x00
-#define RST_INITIAL                  0x3F
-#define FPS_10                       0x00
-
-#define AMG8833_PIXEL_COUNT          64U
 
 #define CF_UART_PORT                 UART_NUM_1
 #define CF_UART_TX_PIN               GPIO_NUM_20
@@ -40,6 +29,7 @@
 #define STATUS_LED_BLINK_MS          200U
 
 #define MAIN_LOOP_PERIOD_MS          100U
+#define HEATMAP_DEBUG_PERIOD_MS      100U
 #define UART_RX_STATS_PERIOD_MS      1000U
 
 typedef struct {
@@ -65,8 +55,6 @@ typedef struct {
 } inference_result_t;
 
 static const char *TAG = "cf_esp_app";
-static i2c_master_bus_handle_t i2c_bus = NULL;
-static i2c_master_dev_handle_t amg_dev = NULL;
 static bool status_led_on = false;
 static int64_t status_led_last_toggle_ms = 0;
 
@@ -95,89 +83,6 @@ static void status_led_update(bool human_detected, int64_t now_ms)
         gpio_set_level(STATUS_LED_PIN, status_led_on ? 1 : 0);
         status_led_last_toggle_ms = now_ms;
     }
-}
-
-static esp_err_t i2c_write_byte(uint8_t reg, uint8_t val)
-{
-    uint8_t buf[2] = {reg, val};
-    return i2c_master_transmit(amg_dev, buf, sizeof(buf), -1);
-}
-
-static esp_err_t i2c_read(uint8_t reg, uint8_t *data, size_t len)
-{
-    return i2c_master_transmit_receive(amg_dev, &reg, 1, data, len, -1);
-}
-
-static float amg_pix_to_c(uint16_t v)
-{
-    v &= 0x0FFF;
-    if (v & 0x0800) {
-        int16_t s = (int16_t)(v | 0xF000);
-        return (float)s * 0.25f;
-    }
-    return (float)v * 0.25f;
-}
-
-static float amg_read_thermistor(void)
-{
-    uint8_t t[2];
-    if (i2c_read(REG_TTHL, t, 2) != ESP_OK) {
-        return NAN;
-    }
-
-    uint16_t raw = (uint16_t)t[0] | ((uint16_t)t[1] << 8);
-    raw &= 0x0FFF;
-    if (raw & 0x0800) {
-        int16_t s = (int16_t)(raw | 0xF000);
-        return (float)s * 0.0625f;
-    }
-    return (float)raw * 0.0625f;
-}
-
-static esp_err_t amg_init(void)
-{
-    esp_err_t err = i2c_write_byte(REG_RST, RST_INITIAL);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "amg reset failed: %s", esp_err_to_name(err));
-        return err;
-    }
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    err = i2c_write_byte(REG_PCTL, PCTL_NORMAL);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "amg power mode failed: %s", esp_err_to_name(err));
-        return err;
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    err = i2c_write_byte(REG_FPSC, FPS_10);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "amg fps set failed: %s", esp_err_to_name(err));
-        return err;
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    return ESP_OK;
-}
-
-static void i2c_setup(void)
-{
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = I2C_SDA_PIN,
-        .scl_io_num = I2C_SCL_PIN,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags = {.enable_internal_pullup = true},
-    };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &i2c_bus));
-
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_7,
-        .device_address = AMG_ADDR,
-        .scl_speed_hz = I2C_FREQ,
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &dev_cfg, &amg_dev));
 }
 
 static blob_stats_t largest_blob_stats(const bool *mask, const float *pix)
@@ -273,8 +178,8 @@ static bool is_human_1m(const blob_stats_t *b, float amb)
 
     if (tmax < amb + 3.0f) return false;
     if (mean < amb + 2.0f) return false;
-    if (tmax > 33.0f || tmax < 28.5f) return false;
-    if (b->size < 6) return false;
+    if (tmax > 33.0f || tmax < 24.5f) return false;
+    if (b->size < 15) return false;
     if (b->size > 50) return false;
     if (std <= 0.45f) return false;
     return true;
@@ -301,7 +206,7 @@ static float ambient_lowk(const float pix[64], int k)
     return s / (float)k;
 }
 
-static inference_result_t run_human_inference(const float pix[64], float bg[64])
+static inference_result_t run_human_inference(const float pix[64], float bg[64], float thermistor_c)
 {
     inference_result_t result = {0};
     bool mask[64];
@@ -326,7 +231,7 @@ static inference_result_t run_human_inference(const float pix[64], float bg[64])
         sum_temp += pix[i];
     }
 
-    const float amb_th = amg_read_thermistor();
+    const float amb_th = thermistor_c;
     const float amb_low = ambient_lowk(pix, 10);
     int above_th = 0;
     for (int i = 0; i < 64; i++) {
@@ -433,9 +338,64 @@ static void send_detection_to_crazyflie(const inference_result_t *result, float 
     }
 }
 
+static void emit_heatmap_frame(int64_t now_ms,
+                               const float pix[64],
+                               float thermistor_c,
+                               const inference_result_t *result)
+{
+    if ((pix == NULL) || (result == NULL)) {
+        return;
+    }
+
+    if (!usb_serial_jtag_is_connected()) {
+        return;
+    }
+
+    char line[1024];
+    int offset = snprintf(line,
+                          sizeof(line),
+                          "AMG_FRAME,%lld,%.2f,%.2f,%.2f,%u,%u,%d",
+                          (long long)now_ms,
+                          thermistor_c,
+                          result->ambient_c,
+                          result->max_temp_c,
+                          result->human_detected ? 1U : 0U,
+                          result->confidence,
+                          result->human_dir);
+    if ((offset < 0) || ((size_t)offset >= sizeof(line))) {
+        return;
+    }
+
+    for (int i = 0; i < 64; i++) {
+        const int written = snprintf(&line[offset], sizeof(line) - (size_t)offset, ",%.2f", pix[i]);
+        if ((written < 0) || ((size_t)written >= (sizeof(line) - (size_t)offset))) {
+            return;
+        }
+        offset += written;
+    }
+
+    if ((size_t)offset < sizeof(line) - 1U) {
+        line[offset++] = '\n';
+    }
+
+    const int written = usb_serial_jtag_write_bytes(line, (size_t)offset, pdMS_TO_TICKS(10));
+    (void)written;
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP32 Crazyflie + AMG8833 firmware starting");
+
+    if (!usb_serial_jtag_is_driver_installed()) {
+        usb_serial_jtag_driver_config_t usb_serial_jtag_config = {
+            .tx_buffer_size = 2048,
+            .rx_buffer_size = 256,
+        };
+        const esp_err_t usb_serial_err = usb_serial_jtag_driver_install(&usb_serial_jtag_config);
+        if (usb_serial_err != ESP_OK) {
+            ESP_LOGW(TAG, "USB Serial/JTAG driver install failed: %s", esp_err_to_name(usb_serial_err));
+        }
+    }
 
     ESP_ERROR_CHECK(uart_cf_init(
         CF_UART_PORT,
@@ -451,28 +411,35 @@ void app_main(void)
              CF_UART_BAUDRATE);
 
     status_led_init();
-    i2c_setup();
-    ESP_ERROR_CHECK(amg_init());
-    ESP_LOGI(TAG,
-             "AMG8833 I2C config: SDA=%d SCL=%d clk=%dHz addr=0x%02X",
-             I2C_SDA_PIN,
-             I2C_SCL_PIN,
-             I2C_FREQ,
-             AMG_ADDR);
+    bool amg_available = false;
+    const esp_err_t amg_init_err = amg8833_init(
+        I2C_NUM_0,
+        I2C_SDA_PIN,
+        I2C_SCL_PIN,
+        I2C_FREQ,
+        AMG_ADDR);
+    if (amg_init_err == ESP_OK) {
+        amg_available = true;
+        ESP_LOGI(TAG,
+                 "AMG8833 I2C config: SDA=%d SCL=%d clk=%dHz addr=0x%02X",
+                 I2C_SDA_PIN,
+                 I2C_SCL_PIN,
+                 I2C_FREQ,
+                 amg8833_get_i2c_address());
+    } else {
+        ESP_LOGW(TAG,
+                 "AMG8833 init failed (%s). Heatmap and human detection stay disabled until the sensor responds on I2C.",
+                 esp_err_to_name(amg_init_err));
+    }
     vTaskDelay(pdMS_TO_TICKS(1200));
 
-    uint8_t raw[128];
-    float pix[64];
-    float bg[64];
-
-    ESP_ERROR_CHECK(i2c_read(REG_PXL, raw, sizeof(raw)));
-    for (int i = 0, p = 0; i < 128; i += 2, ++p) {
-        const uint16_t v = (uint16_t)raw[i] | ((uint16_t)raw[i + 1] << 8);
-        bg[p] = amg_pix_to_c(v);
-    }
+    float pix[AMG8833_PIXEL_COUNT] = {0};
+    float bg[AMG8833_PIXEL_COUNT] = {0};
+    bool bg_ready = false;
 
     int64_t last_log_ms = 0;
     int64_t last_uart_rx_stats_ms = 0;
+    int64_t last_heatmap_frame_ms = 0;
     bool last_human_detected = false;
 
     while (true) {
@@ -491,46 +458,63 @@ void app_main(void)
             last_uart_rx_stats_ms = now_ms;
         }
 
-        if (i2c_read(REG_PXL, raw, sizeof(raw)) != ESP_OK) {
+        if (amg_available) {
+            float thermistor_c = 0.0f;
+            esp_err_t read_err = amg8833_read_pixels(pix, AMG8833_PIXEL_COUNT);
+            if (read_err == ESP_OK) {
+                read_err = amg8833_read_thermistor(&thermistor_c);
+            }
+
+            if (read_err != ESP_OK) {
+                status_led_update(false, now_ms);
+                ESP_LOGW(TAG, "AMG8833 read failed: %s", esp_err_to_name(read_err));
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
+            }
+
+            if (!bg_ready) {
+                memcpy(bg, pix, sizeof(bg));
+                bg_ready = true;
+                status_led_update(false, now_ms);
+                ESP_LOGI(TAG, "AMG8833 background frame captured, heatmap streaming enabled");
+                vTaskDelay(pdMS_TO_TICKS(MAIN_LOOP_PERIOD_MS));
+                continue;
+            }
+
+            const inference_result_t result = run_human_inference(pix, bg, thermistor_c);
+
+            send_detection_to_crazyflie(&result, thermistor_c);
+            if ((now_ms - last_heatmap_frame_ms) >= HEATMAP_DEBUG_PERIOD_MS) {
+                emit_heatmap_frame(now_ms, pix, thermistor_c, &result);
+                last_heatmap_frame_ms = now_ms;
+            }
+            status_led_update(result.human_detected, now_ms);
+
+            if (result.human_detected != last_human_detected) {
+                ESP_LOGI(TAG,
+                         "Human detect transition -> %u (conf=%u dir=%d blob=%d)",
+                         result.human_detected ? 1U : 0U,
+                         result.confidence,
+                         result.human_dir,
+                         result.blob_size);
+                last_human_detected = result.human_detected;
+            }
+
+            if ((now_ms - last_log_ms) >= 1000) {
+                ESP_LOGI(TAG,
+                         "Human=%u conf=%u%% dir=%d blob=%d max=%.2fC avg=%.2fC amb=%.2fC therm=%.2fC",
+                         result.human_detected ? 1U : 0U,
+                         result.confidence,
+                         result.human_dir,
+                         result.blob_size,
+                         result.max_temp_c,
+                         result.avg_temp_c,
+                         result.ambient_c,
+                         thermistor_c);
+                last_log_ms = now_ms;
+            }
+        } else {
             status_led_update(false, now_ms);
-            ESP_LOGW(TAG, "I2C read failed");
-            vTaskDelay(pdMS_TO_TICKS(200));
-            continue;
-        }
-
-        for (int i = 0, p = 0; i < 128; i += 2, ++p) {
-            const uint16_t v = (uint16_t)raw[i] | ((uint16_t)raw[i + 1] << 8);
-            pix[p] = amg_pix_to_c(v);
-        }
-
-        const float thermistor_c = amg_read_thermistor();
-        const inference_result_t result = run_human_inference(pix, bg);
-
-        send_detection_to_crazyflie(&result, thermistor_c);
-        status_led_update(result.human_detected, now_ms);
-
-        if (result.human_detected != last_human_detected) {
-            ESP_LOGI(TAG,
-                     "Human detect transition -> %u (conf=%u dir=%d blob=%d)",
-                     result.human_detected ? 1U : 0U,
-                     result.confidence,
-                     result.human_dir,
-                     result.blob_size);
-            last_human_detected = result.human_detected;
-        }
-
-        if ((now_ms - last_log_ms) >= 1000) {
-            ESP_LOGI(TAG,
-                     "Human=%u conf=%u%% dir=%d blob=%d max=%.2fC avg=%.2fC amb=%.2fC therm=%.2fC",
-                     result.human_detected ? 1U : 0U,
-                     result.confidence,
-                     result.human_dir,
-                     result.blob_size,
-                     result.max_temp_c,
-                     result.avg_temp_c,
-                     result.ambient_c,
-                     thermistor_c);
-            last_log_ms = now_ms;
         }
 
         vTaskDelay(pdMS_TO_TICKS(MAIN_LOOP_PERIOD_MS));

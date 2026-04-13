@@ -4,12 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import html
+import json
+import math
 import pathlib
 import queue
+import shutil
+import subprocess
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, Optional
 import sys
 
@@ -17,6 +25,25 @@ import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+
+try:
+    from PIL import Image, ImageDraw
+except ImportError:
+    Image = None
+    ImageDraw = None
+
+PLOTLY_IMPORT_ERROR: Optional[str] = None
+
+try:
+    import plotly.graph_objects as go
+except Exception as exc:
+    go = None
+    PLOTLY_IMPORT_ERROR = str(exc)
+
+try:
+    from playsound import playsound as playsound_fn
+except ImportError:
+    playsound_fn = None
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -35,9 +62,11 @@ MISSION_NAMES = {
     0: "Reacquire Wall",
     1: "Wall Follow",
     2: "Scan",
-    3: "Signal",
-    4: "Land",
-    5: "Transition",
+    3: "Approach",
+    4: "Bob",
+    5: "Land",
+    6: "Transition",
+    7: "Align",
 }
 
 DIR_NAMES = {
@@ -45,6 +74,24 @@ DIR_NAMES = {
     0: "Center",
     1: "Right",
 }
+
+
+def ensure_plotly():
+    global go
+    global PLOTLY_IMPORT_ERROR
+
+    if go is not None:
+        return go
+
+    try:
+        import plotly.graph_objects as plotly_go
+    except Exception as exc:
+        PLOTLY_IMPORT_ERROR = str(exc)
+        return None
+
+    go = plotly_go
+    PLOTLY_IMPORT_ERROR = None
+    return go
 
 PALETTE = {
     "app_bg": "#080808",
@@ -92,6 +139,10 @@ class FlowSnapshot:
     vel_y: float = 0.0
     cmd_x: float = 0.0
     cmd_y: float = 0.0
+    pos_x_cm: float = 0.0
+    pos_y_cm: float = 0.0
+    pos_z_cm: float = 0.0
+    pos_valid: int = 0
 
 
 @dataclass
@@ -103,6 +154,151 @@ class RangeSnapshot:
     back: int = 32766
     up: int = 32766
     vbat: float = 0.0
+
+
+class TelemetryCsvLogger:
+    FIELDNAMES = [
+        "Time",
+        "uri",
+        "source",
+        "outer",
+        "mission",
+        "mission_name",
+        "shutter",
+        "human",
+        "human_fresh",
+        "human_stable",
+        "human_hold_s",
+        "human_confidence_pct",
+        "human_direction",
+        "human_max_temp_c",
+        "human_thermistor_c",
+        "flow_timestamp_ms",
+        "delta_x",
+        "delta_y",
+        "pos_x_cm",
+        "pos_y_cm",
+        "height_m",
+        "vel_x_mps",
+        "vel_y_mps",
+        "cmd_x_mps",
+        "cmd_y_mps",
+        "front_mm",
+        "left_mm",
+        "right_mm",
+        "back_mm",
+        "up_mm",
+        "vbat_v",
+    ]
+
+    def __init__(self, csv_dir: str, uri: str) -> None:
+        self.uri = uri
+        self.latest_mission = MissionSnapshot()
+        self.latest_flow = FlowSnapshot()
+        self.latest_range = RangeSnapshot()
+
+        timestamp = datetime.now().strftime("%d_%H_%M_%S")
+        base_dir = pathlib.Path(csv_dir).expanduser()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        self.path = base_dir / f"Log_{timestamp}.csv"
+        self._file = self.path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDNAMES)
+        self._writer.writeheader()
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.flush()
+        self._file.close()
+
+    def log_mission(self, snapshot: MissionSnapshot) -> None:
+        self.latest_mission = snapshot
+        self._write_row(source="mission")
+
+    def log_flow(self, snapshot: FlowSnapshot) -> None:
+        self.latest_flow = snapshot
+        self._write_row(source="flow")
+
+    def log_range(self, snapshot: RangeSnapshot) -> None:
+        self.latest_range = snapshot
+        self._write_row(source="range")
+
+    def _write_row(self, *, source: str) -> None:
+        now = time.time()
+        self._writer.writerow(
+            {
+                "Time": datetime.fromtimestamp(now).isoformat(timespec="milliseconds"),
+                "uri": self.uri,
+                "source": source,
+                "outer": self.latest_mission.outer,
+                "mission": self.latest_mission.mission,
+                "mission_name": MISSION_NAMES.get(self.latest_mission.mission, str(self.latest_mission.mission)),
+                "height_m": self.latest_mission.z,
+                "human": self.latest_mission.human,
+                "human_fresh": self.latest_mission.fresh,
+                "human_stable": self.latest_mission.stable,
+                "human_hold_s": self.latest_mission.hold,
+                "human_confidence_pct": self.latest_mission.conf,
+                "human_direction": self.latest_mission.direction,
+                "human_max_temp_c": self.latest_mission.max_temp_c,
+                "human_thermistor_c": self.latest_mission.therm_c,
+                "flow_timestamp_ms": self.latest_flow.timestamp_ms,
+                "delta_x": self.latest_flow.delta_x,
+                "delta_y": self.latest_flow.delta_y,
+                "pos_x_cm": self.latest_flow.pos_x_cm,
+                "pos_y_cm": self.latest_flow.pos_y_cm,
+                "shutter": self.latest_flow.shutter,
+                "vel_x_mps": self.latest_flow.vel_x,
+                "vel_y_mps": self.latest_flow.vel_y,
+                "cmd_x_mps": self.latest_flow.cmd_x,
+                "cmd_y_mps": self.latest_flow.cmd_y,
+                "front_mm": self.latest_range.front,
+                "left_mm": self.latest_range.left,
+                "right_mm": self.latest_range.right,
+                "back_mm": self.latest_range.back,
+                "up_mm": self.latest_range.up,
+                "vbat_v": self.latest_range.vbat,
+            }
+        )
+        self._file.flush()
+
+
+class SoundEffectPlayer:
+    def __init__(self) -> None:
+        self._queue: "queue.Queue[Optional[pathlib.Path]]" = queue.Queue()
+        self._afplay_path = shutil.which("afplay")
+        self._worker = threading.Thread(target=self._run, name="dashboard-sfx", daemon=True)
+        self._worker.start()
+
+    def available(self) -> bool:
+        return self._afplay_path is not None or playsound_fn is not None
+
+    def play(self, sound_path: pathlib.Path) -> bool:
+        if not sound_path.exists() or not self.available():
+            return False
+        self._queue.put(sound_path)
+        return True
+
+    def shutdown(self) -> None:
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        while True:
+            sound_path = self._queue.get()
+            if sound_path is None:
+                break
+
+            try:
+                if self._afplay_path is not None:
+                    process = subprocess.Popen(
+                        [self._afplay_path, str(sound_path)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    process.wait()
+                elif playsound_fn is not None:
+                    playsound_fn(str(sound_path))
+            except Exception:
+                pass
 
 
 class ColorButton(tk.Label):
@@ -223,20 +419,28 @@ class RadioSession(threading.Thread):
         self,
         preferred_uri: Optional[str],
         cache_dir: str,
+        csv_dir: str,
         log_period_ms: int,
         event_queue: "queue.Queue[tuple[str, Dict[str, object]]]",
     ) -> None:
         super().__init__(name="cf-radio-session", daemon=True)
         self.preferred_uri = preferred_uri
         self.cache_dir = cache_dir
+        self.csv_dir = csv_dir
         self.log_period_ms = log_period_ms
         self.event_queue = event_queue
-        self.command_queue: "queue.Queue[tuple[str, Optional[int]]]" = queue.Queue()
+        self.command_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.stop_event = threading.Event()
         self.cf: Optional[Crazyflie] = None
 
     def request_active(self, active: bool) -> None:
         self.command_queue.put(("set_active", 1 if active else 0))
+
+    def request_capture_start(self) -> None:
+        self.command_queue.put(("capture_start", None))
+
+    def request_capture_stop_after(self, delay_s: float) -> None:
+        self.command_queue.put(("capture_stop_after", delay_s))
 
     def shutdown(self) -> None:
         self.stop_event.set()
@@ -262,8 +466,42 @@ class RadioSession(threading.Thread):
 
         cf = Crazyflie(rw_cache=self.cache_dir)
         self.cf = cf
+        csv_logger: Optional[TelemetryCsvLogger] = None
         logconfs: list[LogConfig] = []
         line_buffer: list[str] = []
+        latest_flow = FlowSnapshot()
+        latest_world_x = 0.0
+        latest_world_y = 0.0
+        latest_world_z = 0.0
+        latest_yaw_deg = 0.0
+        origin_capture_pending = False
+        capture_active = False
+        capture_stop_deadline: Optional[float] = None
+
+        def capture_enabled_now() -> bool:
+            nonlocal capture_active
+            nonlocal capture_stop_deadline
+
+            if capture_active and capture_stop_deadline is not None and time.monotonic() >= capture_stop_deadline:
+                capture_active = False
+                capture_stop_deadline = None
+
+            return capture_active
+        origin_world_x: Optional[float] = None
+        origin_world_y: Optional[float] = None
+        origin_world_z: Optional[float] = None
+        origin_yaw_deg: Optional[float] = None
+        mission_outer_var: Optional[str] = None
+        mission_state_var: Optional[str] = None
+        mission_human_var: Optional[str] = None
+        mission_conf_var: Optional[str] = None
+        mission_dir_var: Optional[str] = None
+        mission_fresh_var: Optional[str] = None
+        mission_stable_var: Optional[str] = None
+        mission_hold_var: Optional[str] = None
+        mission_max_var: Optional[str] = None
+        mission_therm_var: Optional[str] = None
+        mission_z_var: Optional[str] = None
 
         def on_console(chars: str) -> None:
             for ch in chars:
@@ -278,39 +516,110 @@ class RadioSession(threading.Thread):
         def on_log_error(logconf: LogConfig, message: str) -> None:
             self._emit("status", level="error", message=f"{logconf.name}: {message}")
 
+        def log_var_exists(complete_name: str) -> bool:
+            if "." not in complete_name:
+                return False
+            if cf.log.toc is None:
+                return False
+            group, name = complete_name.split(".", 1)
+            return cf.log.toc.get_element(group, name) is not None
+
+        def choose_log_var(*candidates: str) -> Optional[str]:
+            for candidate in candidates:
+                if log_var_exists(candidate):
+                    return candidate
+            return None
+
         def on_mission(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
-            self._emit(
-                "mission",
+            snapshot = MissionSnapshot(
                 timestamp_ms=ts,
-                outer=int(data["app.stateOuter"]),
-                mission=int(data["app.mission"]),
-                human=int(data["app.human"]),
-                fresh=int(data["app.humanFresh"]),
-                stable=int(data["app.humanStable"]),
-                hold=float(data["app.humanHold"]),
-                conf=int(data["app.humanConf"]),
-                direction=int(data["app.humanDir"]),
-                z=float(data["stateEstimate.z"]),
-                max_temp_c=int(data["app.humanMax"]) / 100.0,
-                therm_c=int(data["app.humanTherm"]) / 100.0,
+                outer=int(data.get(mission_outer_var, 0)) if mission_outer_var else 0,
+                mission=int(data.get(mission_state_var, 0)) if mission_state_var else 0,
+                human=int(data.get(mission_human_var, 0)) if mission_human_var else 0,
+                fresh=int(data.get(mission_fresh_var, 0)) if mission_fresh_var else 0,
+                stable=int(data.get(mission_stable_var, 0)) if mission_stable_var else 0,
+                hold=float(data.get(mission_hold_var, 0.0)) if mission_hold_var else 0.0,
+                conf=int(data.get(mission_conf_var, 0)) if mission_conf_var else 0,
+                direction=int(data.get(mission_dir_var, 0)) if mission_dir_var else 0,
+                z=float(data.get(mission_z_var, 0.0)) if mission_z_var else 0.0,
+                max_temp_c=(int(data.get(mission_max_var, 0)) / 100.0) if mission_max_var else 0.0,
+                therm_c=(int(data.get(mission_therm_var, 0)) / 100.0) if mission_therm_var else 0.0,
             )
+            if csv_logger is not None and capture_enabled_now():
+                csv_logger.log_mission(snapshot)
+            self._emit("mission", **snapshot.__dict__)
+
+        def emit_flow_snapshot() -> None:
+            nonlocal latest_flow
+            snapshot = FlowSnapshot(**latest_flow.__dict__)
+            if csv_logger is not None and capture_enabled_now():
+                csv_logger.log_flow(snapshot)
+            self._emit("flow", **snapshot.__dict__)
+
+        def update_relative_position() -> None:
+            nonlocal origin_capture_pending
+            nonlocal origin_world_x
+            nonlocal origin_world_y
+            nonlocal origin_world_z
+            nonlocal origin_yaw_deg
+            nonlocal latest_flow
+
+            if origin_capture_pending and origin_world_x is None:
+                origin_world_x = latest_world_x
+                origin_world_y = latest_world_y
+                origin_world_z = latest_world_z
+                origin_yaw_deg = latest_yaw_deg
+                origin_capture_pending = False
+
+            if origin_world_x is None or origin_world_y is None or origin_world_z is None or origin_yaw_deg is None:
+                latest_flow.pos_valid = 0
+                latest_flow.pos_x_cm = 0.0
+                latest_flow.pos_y_cm = 0.0
+                latest_flow.pos_z_cm = 0.0
+                return
+
+            dx = latest_world_x - origin_world_x
+            dy = latest_world_y - origin_world_y
+            dz = latest_world_z - origin_world_z
+            yaw0_rad = math.radians(origin_yaw_deg)
+
+            forward_m = (dx * math.cos(yaw0_rad)) + (dy * math.sin(yaw0_rad))
+            left_m = (-dx * math.sin(yaw0_rad)) + (dy * math.cos(yaw0_rad))
+
+            latest_flow.pos_x_cm = -left_m * 100.0
+            latest_flow.pos_y_cm = forward_m * 100.0
+            latest_flow.pos_z_cm = dz * 100.0
+            latest_flow.pos_valid = 1
 
         def on_flow(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
-            self._emit(
-                "flow",
-                timestamp_ms=ts,
-                delta_x=int(data["motion.deltaX"]),
-                delta_y=int(data["motion.deltaY"]),
-                shutter=int(data["motion.shutter"]),
-                vel_x=float(data["stateEstimate.vx"]),
-                vel_y=float(data["stateEstimate.vy"]),
-                cmd_x=float(data["app.cmdVelX"]),
-                cmd_y=float(data["app.cmdVelY"]),
-            )
+            nonlocal latest_flow
+            latest_flow.timestamp_ms = ts
+            latest_flow.delta_x = int(data["motion.deltaX"])
+            latest_flow.delta_y = int(data["motion.deltaY"])
+            latest_flow.shutter = int(data["motion.shutter"])
+            latest_flow.vel_x = float(data["stateEstimate.vx"])
+            latest_flow.vel_y = float(data["stateEstimate.vy"])
+            latest_flow.cmd_x = float(data["app.cmdVelX"])
+            latest_flow.cmd_y = float(data["app.cmdVelY"])
+            update_relative_position()
+            emit_flow_snapshot()
+
+        def on_pose(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
+            nonlocal latest_flow
+            nonlocal latest_world_x
+            nonlocal latest_world_y
+            nonlocal latest_world_z
+            nonlocal latest_yaw_deg
+            latest_flow.timestamp_ms = ts
+            latest_world_x = float(data["stateEstimate.x"])
+            latest_world_y = float(data["stateEstimate.y"])
+            latest_world_z = float(data["stateEstimate.z"])
+            latest_yaw_deg = float(data["stabilizer.yaw"])
+            update_relative_position()
+            emit_flow_snapshot()
 
         def on_range(ts: int, data: Dict[str, object], _logconf: LogConfig) -> None:
-            self._emit(
-                "range",
+            snapshot = RangeSnapshot(
                 timestamp_ms=ts,
                 front=int(data["range.front"]),
                 left=int(data["range.left"]),
@@ -319,6 +628,9 @@ class RadioSession(threading.Thread):
                 up=int(data["range.up"]),
                 vbat=float(data["pm.vbat"]),
             )
+            if csv_logger is not None and capture_enabled_now():
+                csv_logger.log_range(snapshot)
+            self._emit("range", **snapshot.__dict__)
 
         def set_active_with_retry(active: int) -> None:
             last_error: Optional[Exception] = None
@@ -344,22 +656,59 @@ class RadioSession(threading.Thread):
         try:
             with SyncCrazyflie(uri, cf=cf) as scf:
                 scf.wait_for_params()
+                mission_outer_var = choose_log_var("app.stateOuterLoop", "app.stateOuter")
+                mission_state_var = choose_log_var("app.missionState", "app.mission")
+                mission_human_var = choose_log_var("app.humanDetected", "app.human")
+                mission_conf_var = choose_log_var("app.humanConf")
+                mission_dir_var = choose_log_var("app.humanDir")
+                mission_fresh_var = choose_log_var("app.humanFresh")
+                mission_stable_var = choose_log_var("app.humanStable")
+                mission_hold_var = choose_log_var("app.humanHold")
+                mission_max_var = choose_log_var("app.humanMax")
+                mission_therm_var = choose_log_var("app.humanTherm")
+                mission_z_var = choose_log_var("stateEstimate.z")
+                try:
+                    csv_logger = TelemetryCsvLogger(self.csv_dir, uri)
+                    self._emit("status", level="info", message=f"CSV telemetry logging to {csv_logger.path}")
+                except Exception as exc:
+                    self._emit("status", level="error", message=f"Failed to start CSV telemetry logging: {exc}")
+
+                active_logconfs: list[LogConfig] = []
 
                 mission_cfg = LogConfig(name="mission", period_in_ms=self.log_period_ms)
-                mission_cfg.add_variable("app.stateOuter", "uint8_t")
-                mission_cfg.add_variable("app.mission", "uint8_t")
-                mission_cfg.add_variable("app.human", "uint8_t")
-                mission_cfg.add_variable("app.humanConf", "uint8_t")
-                mission_cfg.add_variable("app.humanDir", "int8_t")
-                mission_cfg.add_variable("app.humanFresh", "uint8_t")
-                mission_cfg.add_variable("app.humanStable", "uint8_t")
-                mission_cfg.add_variable("app.humanHold", "float")
-                mission_cfg.add_variable("app.humanMax", "int16_t")
-                mission_cfg.add_variable("app.humanTherm", "int16_t")
-                mission_cfg.add_variable("stateEstimate.z", "float")
-                mission_cfg.data_received_cb.add_callback(on_mission)
-                mission_cfg.error_cb.add_callback(on_log_error)
-                cf.log.add_config(mission_cfg)
+                mission_log_vars = [
+                    (mission_outer_var, "uint8_t"),
+                    (mission_state_var, "uint8_t"),
+                    (mission_human_var, "uint8_t"),
+                    (mission_conf_var, "uint8_t"),
+                    (mission_dir_var, "int8_t"),
+                    (mission_fresh_var, "uint8_t"),
+                    (mission_stable_var, "uint8_t"),
+                    (mission_hold_var, "float"),
+                    (mission_max_var, "int16_t"),
+                    (mission_therm_var, "int16_t"),
+                    (mission_z_var, "float"),
+                ]
+                mission_var_names = [name for name, _ctype in mission_log_vars if name]
+                for var_name, ctype in mission_log_vars:
+                    if var_name:
+                        mission_cfg.add_variable(var_name, ctype)
+                if mission_var_names:
+                    mission_cfg.data_received_cb.add_callback(on_mission)
+                    mission_cfg.error_cb.add_callback(on_log_error)
+                    try:
+                        cf.log.add_config(mission_cfg)
+                    except Exception as exc:
+                        self._emit("status", level="warning", message=f"Skipping mission log block: {exc}")
+                    else:
+                        active_logconfs.append(mission_cfg)
+                        self._emit(
+                            "status",
+                            level="info",
+                            message=f"Mission log TOC matched: {', '.join(mission_var_names)}",
+                        )
+                else:
+                    self._emit("status", level="warning", message="No compatible mission log variables found in TOC; mission panel will stay default")
 
                 flow_cfg = LogConfig(name="flow", period_in_ms=self.log_period_ms)
                 flow_cfg.add_variable("motion.deltaX", "int16_t")
@@ -371,7 +720,26 @@ class RadioSession(threading.Thread):
                 flow_cfg.add_variable("app.cmdVelY", "float")
                 flow_cfg.data_received_cb.add_callback(on_flow)
                 flow_cfg.error_cb.add_callback(on_log_error)
-                cf.log.add_config(flow_cfg)
+                try:
+                    cf.log.add_config(flow_cfg)
+                except Exception as exc:
+                    self._emit("status", level="warning", message=f"Skipping flow log block: {exc}")
+                else:
+                    active_logconfs.append(flow_cfg)
+
+                pose_cfg = LogConfig(name="pose", period_in_ms=self.log_period_ms)
+                pose_cfg.add_variable("stateEstimate.x", "float")
+                pose_cfg.add_variable("stateEstimate.y", "float")
+                pose_cfg.add_variable("stateEstimate.z", "float")
+                pose_cfg.add_variable("stabilizer.yaw", "float")
+                pose_cfg.data_received_cb.add_callback(on_pose)
+                pose_cfg.error_cb.add_callback(on_log_error)
+                try:
+                    cf.log.add_config(pose_cfg)
+                except Exception as exc:
+                    self._emit("status", level="warning", message=f"Skipping pose log block: {exc}")
+                else:
+                    active_logconfs.append(pose_cfg)
 
                 range_cfg = LogConfig(name="range", period_in_ms=self.log_period_ms)
                 range_cfg.add_variable("range.front", "uint16_t")
@@ -382,11 +750,19 @@ class RadioSession(threading.Thread):
                 range_cfg.add_variable("pm.vbat", "float")
                 range_cfg.data_received_cb.add_callback(on_range)
                 range_cfg.error_cb.add_callback(on_log_error)
-                cf.log.add_config(range_cfg)
+                try:
+                    cf.log.add_config(range_cfg)
+                except Exception as exc:
+                    self._emit("status", level="warning", message=f"Skipping range log block: {exc}")
+                else:
+                    active_logconfs.append(range_cfg)
 
-                logconfs.extend([mission_cfg, flow_cfg, range_cfg])
+                logconfs.extend(active_logconfs)
                 for cfg in logconfs:
-                    cfg.start()
+                    try:
+                        cfg.start()
+                    except Exception as exc:
+                        self._emit("status", level="warning", message=f"Failed to start {cfg.name} log block: {exc}")
 
                 cf.console.receivedChar.add_callback(on_console)
                 set_active_with_retry(0)
@@ -400,8 +776,26 @@ class RadioSession(threading.Thread):
                         continue
 
                     if command == "set_active":
+                        origin_capture_pending = int(value or 0) == 1
+                        if origin_capture_pending:
+                            origin_world_x = None
+                            origin_world_y = None
+                            origin_world_z = None
+                            origin_yaw_deg = None
+                            latest_flow.pos_valid = 0
+                            latest_flow.pos_x_cm = 0.0
+                            latest_flow.pos_y_cm = 0.0
+                            latest_flow.pos_z_cm = 0.0
                         set_active_with_retry(int(value or 0))
                         self._emit("status", level="info", message=f"app.active={int(value or 0)}")
+                    elif command == "capture_start":
+                        capture_active = True
+                        capture_stop_deadline = None
+                        self._emit("status", level="info", message="Mission telemetry capture started")
+                    elif command == "capture_stop_after":
+                        if capture_active:
+                            capture_stop_deadline = time.monotonic() + max(float(value or 0.0), 0.0)
+                            self._emit("status", level="info", message=f"Mission telemetry capture will stop in {float(value or 0.0):.1f}s")
                     elif command == "stop":
                         break
         except Exception as exc:
@@ -415,6 +809,12 @@ class RadioSession(threading.Thread):
             for cfg in logconfs:
                 try:
                     cfg.stop()
+                except Exception:
+                    pass
+
+            if csv_logger is not None:
+                try:
+                    csv_logger.close()
                 except Exception:
                     pass
 
@@ -476,9 +876,26 @@ class DashboardApp:
         self.mission = MissionSnapshot()
         self.flow = FlowSnapshot()
         self.range = RangeSnapshot()
+        self.trace_points: list[tuple[float, float, float]] = []
+        self.trace_active = False
+        self.show_trace_position = False
+        self.path_breath_phase = 0.0
+        self.sfx_player = SoundEffectPlayer()
+        self.beep_sound_path = SCRIPT_DIR / "sound" / "beep.wav"
+        self.human_confirmed_sound_path = SCRIPT_DIR / "sound" / "human_confirmed.wav"
+        self.last_human_sound_snapshot = MissionSnapshot()
+        self.sound_warning_shown = False
+        self.trace_output_dir = pathlib.Path(args.csv_dir).expanduser()
+        self.trace_session_token: Optional[str] = None
+        self.trace_session_uri: Optional[str] = None
+        self.trace_exported = False
+        self.stop_capture_delay_ms: int = 3000  # Time after mission stop to keep capturing telemetry for trace export.
+        self.trace_stop_after_id: Optional[str] = None
+        self.latest_trace_html: Optional[pathlib.Path] = None
         self.console_lines: list[str] = []
-        self.uri_var = tk.StringVar(value=args.uri or "usb://0")
-        self.status_var = tk.StringVar(value="Waiting to connect")
+        initial_uri = args.uri.strip() if args.uri else ""
+        self.uri_var = tk.StringVar(value=initial_uri)
+        self.status_var = tk.StringVar(value="Press Scan to discover a Crazyflie or enter a URI")
         self.connection_var = tk.StringVar(value="Disconnected")
 
         self._configure_root()
@@ -488,26 +905,30 @@ class DashboardApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(60, self._pump_events)
-        if self.args.auto_connect:
+        self.root.after(80, self._animate_path_head)
+        if self.args.auto_connect and initial_uri:
             self.root.after(150, self.connect)
 
     def _configure_root(self) -> None:
         self.root.title("Crazyflie Mission Dashboard")
-        self.root.geometry("980x760")
-        self.root.minsize(900, 700)
+        self.root.geometry("1280x960")
+        self.root.minsize(1160, 860)
         self.root.configure(bg=PALETTE["app_bg"])
 
     def _panel(self, parent: tk.Widget, title: str) -> tk.Frame:
         frame = tk.Frame(parent, bg=PALETTE["panel_bg"], bd=0, highlightthickness=1, highlightbackground=PALETTE["panel_edge"])
+        header_row = tk.Frame(frame, bg=PALETTE["panel_bg"])
+        header_row.pack(fill="x", padx=16, pady=(14, 8))
         header = tk.Label(
-            frame,
+            header_row,
             text=title,
             bg=PALETTE["panel_bg"],
             fg=PALETTE["text_main"],
             font=("Helvetica", 14, "bold"),
             anchor="w",
         )
-        header.pack(fill="x", padx=16, pady=(14, 8))
+        header.pack(side="left", fill="x", expand=True)
+        setattr(frame, "_header_row", header_row)
         return frame
 
     def _value_pair(self, parent: tk.Widget, row: int, label: str) -> tk.Label:
@@ -620,23 +1041,66 @@ class DashboardApp:
         cards.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         cards.grid_columnconfigure(0, weight=1)
         cards.grid_columnconfigure(1, weight=1)
-        cards.grid_rowconfigure(0, weight=1)
-        cards.grid_rowconfigure(1, weight=1)
+        cards.grid_columnconfigure(2, weight=1)
+        cards.grid_columnconfigure(3, weight=1)
+        cards.grid_rowconfigure(0, weight=3)
+        cards.grid_rowconfigure(1, weight=2)
 
         self.mission_frame = self._panel(cards, "Mission")
-        self.mission_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 9), pady=(0, 9))
+        self.mission_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 9))
         self._build_mission_panel()
 
         self.human_frame = self._panel(cards, "Human Detection")
-        self.human_frame.grid(row=0, column=1, sticky="nsew", padx=(9, 0), pady=(0, 9))
+        self.human_frame.grid(row=0, column=1, sticky="nsew", padx=6, pady=(0, 9))
         self._build_human_panel()
 
+        self.path_frame = self._panel(cards, "Flying Path")
+        self.path_frame.grid(row=0, column=2, columnspan=2, sticky="nsew", padx=(6, 0), pady=(0, 9))
+        self.open_path_button = ColorButton(
+            getattr(self.path_frame, "_header_row"),
+            text="Open 3D",
+            command=self.open_trace_html,
+            bg="#252525",
+            fg="#ffffff",
+            active_bg="#1b1b1b",
+            active_fg="#ffffff",
+            width=9,
+            font=("Helvetica", 10, "bold"),
+        )
+        self.open_path_button.set_state("disabled")
+        self.open_path_button.pack(side="right")
+        self.stop_trace_button = ColorButton(
+            getattr(self.path_frame, "_header_row"),
+            text="Stop",
+            command=self.stop_trace_capture,
+            bg="#252525",
+            fg="#ffffff",
+            active_bg="#1b1b1b",
+            active_fg="#ffffff",
+            width=8,
+            font=("Helvetica", 10, "bold"),
+        )
+        self.stop_trace_button.pack(side="right", padx=(0, 8))
+        self.clear_path_button = ColorButton(
+            getattr(self.path_frame, "_header_row"),
+            text="Clear",
+            command=self.clear_trace_dashboard,
+            bg="#252525",
+            fg="#ffffff",
+            active_bg="#1b1b1b",
+            active_fg="#ffffff",
+            width=8,
+            font=("Helvetica", 10, "bold"),
+        )
+        self.clear_path_button.pack(side="right", padx=(0, 8))
+        self._build_path_panel()
+
         self.flow_frame = self._panel(cards, "Flow")
-        self.flow_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 9), pady=(9, 0))
+        self.flow_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=(0, 6), pady=(9, 0))
         self._build_flow_panel()
 
         self.range_frame = self._panel(cards, "Range Sector")
-        self.range_frame.grid(row=1, column=1, sticky="nsew", padx=(9, 0), pady=(9, 0))
+        self.range_frame.grid(row=1, column=2, columnspan=2, sticky="nsew", padx=(6, 0), pady=(9, 0))
         self._build_range_panel()
 
         console_frame = self._panel(self.root, "Status Log")
@@ -678,16 +1142,18 @@ class DashboardApp:
         self.fresh_value.pack(side="left")
         self.stable_value = tk.Label(flags_row, text="Stable: --", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11))
         self.stable_value.pack(side="left", padx=(20, 0))
+        self.uart_status_label = tk.Label(flags_row, text="UART", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11, "bold"))
+        self.uart_status_label.pack(side="right", padx=(8, 0))
+        self.uart_status_canvas = tk.Canvas(flags_row, width=16, height=16, bg=PALETTE["panel_bg"], highlightthickness=0)
+        self.uart_status_canvas.pack(side="right")
+        self.uart_status_canvas.create_rectangle(2, 2, 14, 14, fill="#d93025", outline=PALETTE["text_muted"], width=1, tags="uart_led")
 
         self.human_led_canvas = tk.Canvas(body, width=180, height=180, bg=PALETTE["panel_bg"], highlightthickness=0)
         self.human_led_canvas.pack(pady=(6, 12))
         self.human_led_canvas.create_oval(20, 20, 160, 160, fill=PALETTE["human_off"], outline=PALETTE["text_muted"], width=4, tags="led")
         self.human_led_canvas.create_text(90, 90, text="NO\nHUMAN", fill=PALETTE["text_main"], font=("Helvetica", 18, "bold"), tags="led_text")
-
-        self.human_status = tk.Label(body, text="Waiting for telemetry", bg=PALETTE["panel_bg"], fg=PALETTE["text_main"], font=("Helvetica", 13, "bold"))
-        self.human_status.pack(pady=(0, 10))
         self.max_temp_value = tk.Label(body, text="Max Temp: --", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11))
-        self.max_temp_value.pack(anchor="w")
+        self.max_temp_value.pack(anchor="w", pady=(0, 2))
         self.therm_value = tk.Label(body, text="Thermistor: --", bg=PALETTE["panel_bg"], fg=PALETTE["text_dim"], font=("Helvetica", 11))
         self.therm_value.pack(anchor="w")
 
@@ -699,7 +1165,23 @@ class DashboardApp:
         self.shutter_value = self._value_pair(body, 1, "Shutter")
         self.vel_value = self._value_pair(body, 2, "Velocity")
         self.cmd_value = self._value_pair(body, 3, "Command")
-        self.flow_age_value = self._value_pair(body, 4, "Timestamp")
+        self.pos_x_value = self._value_pair(body, 4, "X (start)")
+        self.pos_y_value = self._value_pair(body, 5, "Y (start)")
+        self.flow_age_value = self._value_pair(body, 6, "Timestamp")
+
+    def _build_path_panel(self) -> None:
+        body = tk.Frame(self.path_frame, bg=PALETTE["panel_bg"])
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        self.path_canvas = tk.Canvas(
+            body,
+            width=560,
+            height=300,
+            bg=PALETTE["canvas_bg"],
+            highlightthickness=0,
+        )
+        self.path_canvas.pack(fill="both", expand=True)
+        self.path_canvas.bind("<Configure>", lambda _event: self._render_path())
 
     def _build_range_panel(self) -> None:
         body = tk.Frame(self.range_frame, bg=PALETTE["panel_bg"])
@@ -752,6 +1234,15 @@ class DashboardApp:
         self.scan_worker.start()
 
     def start_mission(self) -> None:
+        self._cancel_trace_stop_timer()
+        self._export_trace_image_if_needed()
+        self.trace_points = []
+        self.trace_active = True
+        self.show_trace_position = True
+        self.trace_session_token = datetime.now().strftime("%d_%H_%M_%S")
+        self.trace_session_uri = self.uri_var.get().strip() or "unknown_uri"
+        self.trace_exported = False
+        self._render_path()
         if not self.worker or not self.connected:
             self.pending_start = True
             self._append_console("Start requested without an active link. Reconnecting first.")
@@ -759,18 +1250,28 @@ class DashboardApp:
             return
 
         self.pending_start = False
+        self.worker.request_capture_start()
         self.worker.request_active(True)
         self._append_console("Start button pressed")
 
     def stop_mission(self) -> None:
         self.pending_start = False
         if not self.worker or not self.connected:
+            self._finish_trace_capture_window()
             return
+        self._cancel_trace_stop_timer()
+        if self.trace_active:
+            self.trace_stop_after_id = self.root.after(int(self.stop_capture_delay_ms), self._finish_trace_capture_window)
+        self.worker.request_capture_stop_after(self.stop_capture_delay_ms / 1000.0)
         self.worker.request_active(False)
-        self._append_console("Stop button pressed")
+        self._append_console("Stop button pressed; capture will stop after landing window")
 
     def on_close(self) -> None:
         self.closing = True
+        self._cancel_trace_stop_timer()
+        self.trace_active = False
+        self._export_trace_image_if_needed()
+        self.sfx_player.shutdown()
         if self.worker:
             self.worker.shutdown()
         self.root.after(150, self.root.destroy)
@@ -784,6 +1285,21 @@ class DashboardApp:
         self.console_text.insert("end", "\n".join(self.console_lines))
         self.console_text.see("end")
         self.console_text.configure(state="disabled")
+
+    def open_trace_html(self) -> None:
+        if not self.trace_points:
+            self._append_console("No trace points have been recorded for the current session yet")
+            return
+
+        if self.trace_points and not self.trace_exported:
+            self._export_trace_image_if_needed()
+
+        if self.latest_trace_html is not None and self.latest_trace_html.exists():
+            webbrowser.open(self.latest_trace_html.as_uri())
+            self._append_console(f"Opened 3D path in browser: {self.latest_trace_html}")
+            return
+
+        self._append_console("No exported 3D path is available yet")
 
     def _handle_status(self, payload: Dict[str, object]) -> None:
         message = str(payload.get("message", ""))
@@ -801,17 +1317,728 @@ class DashboardApp:
         if self.pending_start and self.worker:
             self.pending_start = False
             self.status_var.set("Link restored. Sending app.active=1")
+            self.worker.request_capture_start()
             self.worker.request_active(True)
             self._append_console("Auto-starting mission after reconnect")
 
     def _handle_disconnected(self) -> None:
         self.connected = False
+        self.last_human_sound_snapshot = MissionSnapshot()
+        self._cancel_trace_stop_timer()
+        self.trace_active = False
+        self.show_trace_position = False
+        self._export_trace_image_if_needed()
         self.connection_var.set("Disconnected")
         self.worker = None
         self._set_ui_state(self.STATE_DISCONNECTED)
         if not self.closing:
             self.status_var.set("Disconnected")
             self._append_console("Radio session stopped")
+
+    def _append_trace_point(self) -> None:
+        if not self.trace_active or not self.flow.pos_valid:
+            return
+
+        point = (self.flow.pos_x_cm, self.flow.pos_y_cm, self.flow.pos_z_cm)
+        if self.trace_points:
+            last_x, last_y, last_z = self.trace_points[-1]
+            dist_sq = ((point[0] - last_x) ** 2) + ((point[1] - last_y) ** 2) + ((point[2] - last_z) ** 2)
+            if dist_sq < 0.25:
+                return
+
+        self.trace_points.append(point)
+        if len(self.trace_points) > 2500:
+            self.trace_points = self.trace_points[-2500:]
+
+    def _cancel_trace_stop_timer(self) -> None:
+        if self.trace_stop_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.trace_stop_after_id)
+        except Exception:
+            pass
+        self.trace_stop_after_id = None
+
+    def _finish_trace_capture_window(self) -> None:
+        self.trace_stop_after_id = None
+        if not self.trace_active:
+            return
+        self.trace_active = False
+        self._export_trace_image_if_needed()
+        self._append_console("Telemetry capture window closed")
+
+    def stop_trace_capture(self) -> None:
+        self._cancel_trace_stop_timer()
+        if self.worker and self.connected:
+            self.worker.request_capture_stop_after(0.0)
+
+        if not self.trace_active:
+            self._append_console("Trace capture is not active")
+            return
+
+        self.trace_active = False
+        self._export_trace_image_if_needed()
+        self._append_console("Trace capture stopped immediately")
+
+    def clear_trace_dashboard(self) -> None:
+        if self.trace_active or self.trace_stop_after_id is not None:
+            self._append_console("Cannot clear the flying path while a trace session is still active")
+            return
+
+        self.trace_points = []
+        self.show_trace_position = False
+        self.trace_exported = False
+        self.trace_session_token = None
+        self.trace_session_uri = None
+        self.latest_trace_html = None
+        self.open_path_button.set_state("disabled")
+        self.flow.pos_valid = 0
+        self.flow.pos_x_cm = 0.0
+        self.flow.pos_y_cm = 0.0
+        self.flow.pos_z_cm = 0.0
+        self._render_flow()
+        self._render_path()
+        self._append_console("Cleared flying path trace and mission-relative XY display")
+
+    def _unique_export_path(self, output_path: pathlib.Path) -> pathlib.Path:
+        if not output_path.exists():
+            return output_path
+
+        stem = output_path.stem
+        suffix = output_path.suffix
+        parent = output_path.parent
+        counter = 1
+        while True:
+            candidate = parent / f"{stem}_{counter}{suffix}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    def _play_human_sfx(self, previous: MissionSnapshot, current: MissionSnapshot) -> None:
+        if not self.connected:
+            return
+
+        if not self.sfx_player.available():
+            if not self.sound_warning_shown:
+                self.sound_warning_shown = True
+                self._append_console("WARNING: No audio playback backend is available for dashboard sound effects")
+            return
+
+        if not self.beep_sound_path.exists() or not self.human_confirmed_sound_path.exists():
+            if not self.sound_warning_shown:
+                self.sound_warning_shown = True
+                self._append_console("WARNING: Human-detection sound files are missing in tools/sound")
+            return
+
+        if not previous.human and current.human:
+            self.sfx_player.play(self.beep_sound_path)
+
+        if not previous.stable and current.stable:
+            self.sfx_player.play(self.human_confirmed_sound_path)
+
+    def _build_path_scene(self, width: float, height: float) -> Optional[Dict[str, object]]:
+        if not self.trace_points:
+            return None
+
+        margin = 24.0
+        samples = [(0.0, 0.0, 0.0)] + self.trace_points
+
+        def project(point: tuple[float, float, float]) -> tuple[float, float]:
+            x_cm, y_cm, z_cm = point
+            return (x_cm + 0.55 * y_cm, -0.30 * y_cm - 0.85 * z_cm)
+
+        def project_shadow(point: tuple[float, float, float]) -> tuple[float, float]:
+            x_cm, y_cm, _z_cm = point
+            return (x_cm + 0.55 * y_cm, -0.30 * y_cm)
+
+        projected = [project(point) for point in samples]
+        shadows = [project_shadow(point) for point in samples]
+        combined = projected + shadows
+
+        min_u = min(u for u, _ in combined)
+        max_u = max(u for u, _ in combined)
+        min_v = min(v for _, v in combined)
+        max_v = max(v for _, v in combined)
+
+        span_u = max(max_u - min_u, 50.0)
+        span_v = max(max_v - min_v, 40.0)
+        scale = min((width - 2.0 * margin) / span_u, (height - 2.0 * margin) / span_v)
+        scale = max(1.1, min(scale, 4.2))
+
+        offset_x = (width - span_u * scale) / 2.0 - min_u * scale
+        offset_y = (height - span_v * scale) / 2.0 - min_v * scale
+
+        def to_screen(proj: tuple[float, float]) -> tuple[float, float]:
+            u, v = proj
+            return (offset_x + u * scale, offset_y + v * scale)
+
+        shadow_points = [to_screen(proj) for proj in shadows]
+        path_points = [to_screen(proj) for proj in projected]
+        start_shadow = shadow_points[0]
+
+        floor_polygon = [
+            to_screen(project_shadow((-35.0, 0.0, 0.0))),
+            to_screen(project_shadow((35.0, 0.0, 0.0))),
+            to_screen(project_shadow((35.0, 55.0, 0.0))),
+            to_screen(project_shadow((-35.0, 55.0, 0.0))),
+        ]
+
+        x_axis = to_screen(project_shadow((18.0, 0.0, 0.0)))
+        y_axis = to_screen(project_shadow((0.0, 18.0, 0.0)))
+        z_axis = to_screen(project((0.0, 0.0, 18.0)))
+        x_axis_label = to_screen(project_shadow((22.0, 0.0, 0.0)))
+        y_axis_label = to_screen(project_shadow((0.0, 22.0, 0.0)))
+
+        return {
+            "floor_polygon": floor_polygon,
+            "start_shadow": start_shadow,
+            "x_axis": x_axis,
+            "y_axis": y_axis,
+            "z_axis": z_axis,
+            "x_axis_label": x_axis_label,
+            "y_axis_label": y_axis_label,
+            "shadow_points": shadow_points,
+            "path_points": path_points,
+        }
+
+    def _render_path(self) -> None:
+        if not hasattr(self, "path_canvas"):
+            return
+
+        canvas = self.path_canvas
+        width = max(canvas.winfo_width(), 1)
+        height = max(canvas.winfo_height(), 1)
+        canvas.delete("all")
+
+        scene = self._build_path_scene(width, height)
+        if scene is None:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="Trace starts after Start Mission",
+                fill=PALETTE["text_dim"],
+                font=("Helvetica", 14, "bold"),
+            )
+            return
+
+        canvas.create_polygon(
+            *[coord for point in scene["floor_polygon"] for coord in point],
+            fill="#101010",
+            outline="#1b1b1b",
+            width=1,
+        )
+
+        start_shadow = scene["start_shadow"]
+        canvas.create_line(*start_shadow, *scene["x_axis"], fill="#3b3b3b", width=2)
+        canvas.create_line(*start_shadow, *scene["y_axis"], fill="#3b3b3b", width=2)
+        canvas.create_line(*start_shadow, *scene["z_axis"], fill="#383838", width=2)
+        canvas.create_text(start_shadow[0] + 8, start_shadow[1] + 12, text="START", fill=PALETTE["text_dim"], font=("Helvetica", 10, "bold"), anchor="w")
+        canvas.create_text(scene["x_axis_label"][0] + 8, scene["x_axis_label"][1] + 2, text="X", fill="#7a7a7a", font=("Helvetica", 11, "bold"), anchor="w")
+        canvas.create_text(scene["y_axis_label"][0] + 8, scene["y_axis_label"][1] + 2, text="Y", fill="#7a7a7a", font=("Helvetica", 11, "bold"), anchor="w")
+
+        shadow_points = scene["shadow_points"]
+        path_points = scene["path_points"]
+        shadow_flat = [coord for point in shadow_points for coord in point]
+        path_flat = [coord for point in path_points for coord in point]
+
+        if len(shadow_points) >= 2:
+            canvas.create_line(*shadow_flat, fill="#3a2417", width=7, smooth=True, splinesteps=12)
+
+        step = max(1, len(path_points) // 10)
+        for idx in range(step, len(path_points), step):
+            canvas.create_line(
+                *shadow_points[idx],
+                *path_points[idx],
+                fill="#4a382d",
+                width=1,
+            )
+
+        if len(path_points) >= 2:
+            canvas.create_line(*path_flat, fill="#FC4C02", width=4, smooth=True, splinesteps=12)
+
+        head_x, head_y = path_points[-1]
+        shadow_x, shadow_y = shadow_points[-1]
+        canvas.create_line(shadow_x, shadow_y, head_x, head_y, fill="#6d4b3a", width=2)
+
+        breath = 0.5 * (1.0 + math.sin(self.path_breath_phase))
+        glow_r = 10.0 + 4.0 * breath
+        mid_r = 6.5 + 2.0 * breath
+        head_r = 4.0 + 1.0 * breath
+
+        canvas.create_oval(head_x - glow_r, head_y - glow_r, head_x + glow_r, head_y + glow_r, outline="#ff8a75", width=2)
+        canvas.create_oval(head_x - mid_r, head_y - mid_r, head_x + mid_r, head_y + mid_r, outline="#ff5a4f", width=3)
+        canvas.create_oval(head_x - head_r, head_y - head_r, head_x + head_r, head_y + head_r, fill="#ff3b30", outline="#ffd4ce", width=1)
+
+    def _export_trace_image_if_needed(self) -> None:
+        if self.trace_exported:
+            return
+
+        if not self.trace_points:
+            if self.trace_session_token is not None:
+                self._append_console("No trace points were recorded; skipping path export")
+            return
+
+        timestamp = self.trace_session_token or datetime.now().strftime("%d_%H_%M_%S")
+        self.trace_output_dir.mkdir(parents=True, exist_ok=True)
+        image_path = self._unique_export_path(self.trace_output_dir / f"PathOverview_{timestamp}_Log.jpg")
+        html_path = self._unique_export_path(self.trace_output_dir / f"3DPlot_{timestamp}.html")
+        image_saved = self._save_path_image(image_path)
+        html_saved = self._save_path_html(html_path)
+        self.trace_exported = image_saved and html_saved
+        if html_saved:
+            self.latest_trace_html = html_path
+            self.open_path_button.set_state("normal")
+        else:
+            self.latest_trace_html = None
+            self.open_path_button.set_state("disabled")
+        if image_saved:
+            self._append_console(f"Saved flying path image to {image_path}")
+        if html_saved:
+            self._append_console(f"Saved interactive 3D path to {html_path}")
+        elif image_saved:
+            reason = PLOTLY_IMPORT_ERROR or "Plotly export did not create an HTML file"
+            self._append_console(f"WARNING: 3D HTML path export skipped: {reason}")
+
+    def _save_path_image(self, output_path: pathlib.Path) -> bool:
+        if Image is None or ImageDraw is None:
+            return False
+
+        width = 1280
+        height = 900
+        scene = self._build_path_scene(width, height)
+        if scene is None:
+            return False
+
+        try:
+            image = Image.new("RGBA", (width, height), PALETTE["canvas_bg"])
+            draw = ImageDraw.Draw(image, "RGBA")
+
+            draw.polygon(scene["floor_polygon"], fill=(16, 16, 16, 255), outline=(27, 27, 27, 255))
+
+            start_shadow = scene["start_shadow"]
+            draw.line([start_shadow, scene["x_axis"]], fill=(80, 80, 80, 150), width=4)
+            draw.line([start_shadow, scene["y_axis"]], fill=(80, 80, 80, 150), width=4)
+            draw.line([start_shadow, scene["z_axis"]], fill=(64, 64, 64, 170), width=4)
+            draw.text((start_shadow[0] + 14, start_shadow[1] + 14), "START", fill=(138, 138, 138, 220))
+            draw.text((scene["x_axis_label"][0] + 12, scene["x_axis_label"][1] + 2), "X", fill=(150, 150, 150, 120))
+            draw.text((scene["y_axis_label"][0] + 12, scene["y_axis_label"][1] + 2), "Y", fill=(150, 150, 150, 120))
+
+            shadow_points = scene["shadow_points"]
+            path_points = scene["path_points"]
+            if len(shadow_points) >= 2:
+                draw.line(shadow_points, fill=(58, 36, 23, 220), width=16)
+
+            step = max(1, len(path_points) // 10)
+            for idx in range(step, len(path_points), step):
+                draw.line([shadow_points[idx], path_points[idx]], fill=(74, 56, 45, 180), width=2)
+
+            if len(path_points) >= 2:
+                draw.line(path_points, fill=(252, 76, 2, 255), width=9)
+
+            head_x, head_y = path_points[-1]
+            shadow_x, shadow_y = shadow_points[-1]
+            draw.line([(shadow_x, shadow_y), (head_x, head_y)], fill=(109, 75, 58, 220), width=3)
+            draw.ellipse((head_x - 26, head_y - 26, head_x + 26, head_y + 26), outline=(255, 138, 117, 160), width=4)
+            draw.ellipse((head_x - 16, head_y - 16, head_x + 16, head_y + 16), outline=(255, 90, 79, 220), width=5)
+            draw.ellipse((head_x - 9, head_y - 9, head_x + 9, head_y + 9), fill=(255, 59, 48, 255), outline=(255, 212, 206, 255), width=2)
+
+            image.convert("RGB").save(output_path, format="JPEG", quality=92)
+        except Exception as exc:
+            self._append_console(f"WARNING: Flying path image export failed: {exc}")
+            return False
+        return output_path.exists()
+
+    def _save_path_html(self, output_path: pathlib.Path) -> bool:
+        global PLOTLY_IMPORT_ERROR
+        if not self.trace_points:
+            return False
+
+        xs = [point[0] for point in self.trace_points]
+        ys = [point[1] for point in self.trace_points]
+        zs = [point[2] for point in self.trace_points]
+
+        plotly_go = ensure_plotly()
+        if plotly_go is None:
+            append_console = getattr(self, "_append_console", None)
+            if callable(append_console):
+                append_console(f"WARNING: Plotly is unavailable, using built-in 3D HTML exporter: {PLOTLY_IMPORT_ERROR or 'unknown reason'}")
+            return self._save_path_html_fallback(output_path, xs, ys, zs, PLOTLY_IMPORT_ERROR or "Plotly is unavailable")
+
+        fig = plotly_go.Figure()
+        fig.add_trace(
+            plotly_go.Scatter3d(
+                x=xs,
+                y=ys,
+                z=zs,
+                mode="lines",
+                line={"color": "#FC4C02", "width": 6},
+                name="Trace",
+            )
+        )
+        fig.add_trace(
+            plotly_go.Scatter3d(
+                x=[xs[-1]],
+                y=[ys[-1]],
+                z=[zs[-1]],
+                mode="markers",
+                marker={"size": 7, "color": "#ff3b30"},
+                name="Current Position",
+            )
+        )
+        fig.add_trace(
+            plotly_go.Scatter3d(
+                x=[0.0],
+                y=[0.0],
+                z=[0.0],
+                mode="markers",
+                marker={"size": 5, "color": "#9a9a9a"},
+                name="Start",
+            )
+        )
+
+        fig.update_layout(
+            template="plotly_dark",
+            title="Crazyflie Flying Path",
+            paper_bgcolor="#080808",
+            plot_bgcolor="#080808",
+            scene={
+                "xaxis": {
+                    "title": "X (cm)",
+                    "backgroundcolor": "rgba(0,0,0,0)",
+                    "gridcolor": "rgba(150,150,150,0.18)",
+                    "zerolinecolor": "rgba(180,180,180,0.28)",
+                },
+                "yaxis": {
+                    "title": "Y (cm)",
+                    "backgroundcolor": "rgba(0,0,0,0)",
+                    "gridcolor": "rgba(150,150,150,0.18)",
+                    "zerolinecolor": "rgba(180,180,180,0.28)",
+                },
+                "zaxis": {
+                    "title": "Z (cm)",
+                    "backgroundcolor": "rgba(0,0,0,0)",
+                    "gridcolor": "rgba(150,150,150,0.18)",
+                    "zerolinecolor": "rgba(180,180,180,0.28)",
+                },
+                "aspectmode": "data",
+                "camera": {
+                    "eye": {"x": 1.45, "y": -1.6, "z": 1.15},
+                },
+            },
+            margin={"l": 0, "r": 0, "t": 50, "b": 0},
+            legend={"orientation": "h", "yanchor": "bottom", "y": 0.98, "xanchor": "right", "x": 1.0},
+        )
+        try:
+            fig.write_html(str(output_path), include_plotlyjs=True, full_html=True)
+        except Exception as exc:
+            PLOTLY_IMPORT_ERROR = str(exc)
+            append_console = getattr(self, "_append_console", None)
+            if callable(append_console):
+                append_console(f"WARNING: Plotly HTML export failed, using built-in fallback: {exc}")
+            return self._save_path_html_fallback(output_path, xs, ys, zs, str(exc))
+        return output_path.exists()
+
+    def _save_path_html_fallback(self,
+                                 output_path: pathlib.Path,
+                                 xs: list[float],
+                                 ys: list[float],
+                                 zs: list[float],
+                                 reason: str) -> bool:
+        if not xs or not ys or not zs:
+            return False
+
+        points = [[float(x), float(y), float(z)] for x, y, z in zip(xs, ys, zs)]
+        safe_reason = html.escape(reason or "unknown")
+        try:
+            output_path.write_text(
+                f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crazyflie Flying Path</title>
+  <style>
+    html, body {{
+      margin: 0;
+      height: 100%;
+      background: #080808;
+      color: #f5f5f5;
+      font-family: Helvetica, Arial, sans-serif;
+    }}
+    body {{
+      display: flex;
+      flex-direction: column;
+    }}
+    .topbar {{
+      padding: 12px 16px 8px 16px;
+      border-bottom: 1px solid #1f1f1f;
+      background: #101010;
+    }}
+    .title {{
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }}
+    .subtitle {{
+      font-size: 13px;
+      color: #b8b8b8;
+    }}
+    .fallback {{
+      margin-top: 6px;
+      font-size: 12px;
+      color: #8a8a8a;
+    }}
+    #viewport {{
+      width: 100%;
+      height: 100%;
+      display: block;
+      cursor: grab;
+    }}
+    #viewport.dragging {{
+      cursor: grabbing;
+    }}
+    .footer {{
+      padding: 8px 16px 12px 16px;
+      font-size: 12px;
+      color: #8a8a8a;
+      border-top: 1px solid #1f1f1f;
+      background: #101010;
+    }}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="title">Crazyflie Flying Path</div>
+    <div class="subtitle">Built-in 3D exporter. Drag to rotate, mouse wheel to zoom.</div>
+    <div class="fallback">Fallback exporter used: {safe_reason}</div>
+  </div>
+  <canvas id="viewport"></canvas>
+  <div class="footer" id="stats"></div>
+  <script>
+    const points = {json.dumps(points)};
+    const canvas = document.getElementById("viewport");
+    const ctx = canvas.getContext("2d");
+    const stats = document.getElementById("stats");
+
+    let yaw = -0.95;
+    let pitch = 0.55;
+    let zoom = 1.0;
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
+
+    const ranges = {{
+      minX: Math.min(...points.map((p) => p[0]), 0),
+      maxX: Math.max(...points.map((p) => p[0]), 0),
+      minY: Math.min(...points.map((p) => p[1]), 0),
+      maxY: Math.max(...points.map((p) => p[1]), 0),
+      minZ: Math.min(...points.map((p) => p[2]), 0),
+      maxZ: Math.max(...points.map((p) => p[2]), 0),
+    }};
+
+    const center = {{
+      x: (ranges.minX + ranges.maxX) / 2,
+      y: (ranges.minY + ranges.maxY) / 2,
+      z: (ranges.minZ + ranges.maxZ) / 2,
+    }};
+
+    const spanX = Math.max(1, ranges.maxX - ranges.minX);
+    const spanY = Math.max(1, ranges.maxY - ranges.minY);
+    const spanZ = Math.max(1, ranges.maxZ - ranges.minZ);
+    const maxSpan = Math.max(spanX, spanY, spanZ);
+
+    function resize() {{
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      draw();
+    }}
+
+    function rotatePoint(px, py, pz) {{
+      const x0 = px - center.x;
+      const y0 = py - center.y;
+      const z0 = pz - center.z;
+
+      const cy = Math.cos(yaw);
+      const sy = Math.sin(yaw);
+      const cp = Math.cos(pitch);
+      const sp = Math.sin(pitch);
+
+      const x1 = x0 * cy - y0 * sy;
+      const y1 = x0 * sy + y0 * cy;
+      const z1 = z0;
+
+      return {{
+        x: x1,
+        y: y1 * cp - z1 * sp,
+        z: y1 * sp + z1 * cp,
+      }};
+    }}
+
+    function project(px, py, pz) {{
+      const r = rotatePoint(px, py, pz);
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      const scale = (Math.min(w, h) * 0.36 * zoom) / maxSpan;
+      const depth = 1.0 / (1.0 + Math.max(-2.5, Math.min(2.5, r.z / maxSpan)));
+      return {{
+        x: (w / 2) + r.x * scale * depth,
+        y: (h / 2) - r.y * scale * depth,
+        depth: r.z,
+      }};
+    }}
+
+    function drawAxes() {{
+      const axisLen = maxSpan * 0.35;
+      const origin = project(0, 0, 0);
+      const axisX = project(axisLen, 0, 0);
+      const axisY = project(0, axisLen, 0);
+      const axisZ = project(0, 0, axisLen);
+
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "rgba(160,160,160,0.55)";
+      ctx.beginPath();
+      ctx.moveTo(origin.x, origin.y);
+      ctx.lineTo(axisX.x, axisX.y);
+      ctx.moveTo(origin.x, origin.y);
+      ctx.lineTo(axisY.x, axisY.y);
+      ctx.moveTo(origin.x, origin.y);
+      ctx.lineTo(axisZ.x, axisZ.y);
+      ctx.stroke();
+
+      ctx.fillStyle = "rgba(200,200,200,0.9)";
+      ctx.font = "12px Helvetica";
+      ctx.fillText("START", origin.x + 8, origin.y + 14);
+      ctx.fillText("X", axisX.x + 6, axisX.y);
+      ctx.fillText("Y", axisY.x + 6, axisY.y);
+      ctx.fillText("Z", axisZ.x + 6, axisZ.y);
+    }}
+
+    function drawPath() {{
+      if (points.length < 1) {{
+        return;
+      }}
+
+      const projected = points.map((p) => project(p[0], p[1], p[2]));
+      const shadow = points.map((p) => project(p[0], p[1], 0));
+
+      if (shadow.length > 1) {{
+        ctx.strokeStyle = "rgba(90,55,35,0.55)";
+        ctx.lineWidth = 10;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(shadow[0].x, shadow[0].y);
+        for (const p of shadow.slice(1)) {{
+          ctx.lineTo(p.x, p.y);
+        }}
+        ctx.stroke();
+      }}
+
+      if (projected.length > 1) {{
+        ctx.strokeStyle = "#FC4C02";
+        ctx.lineWidth = 5;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        ctx.moveTo(projected[0].x, projected[0].y);
+        for (const p of projected.slice(1)) {{
+          ctx.lineTo(p.x, p.y);
+        }}
+        ctx.stroke();
+      }}
+
+      const start = projected[0];
+      const current = projected[projected.length - 1];
+
+      ctx.fillStyle = "#9a9a9a";
+      ctx.beginPath();
+      ctx.arc(start.x, start.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = "rgba(255,138,117,0.75)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(current.x, current.y, 14, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.strokeStyle = "rgba(255,90,79,0.95)";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(current.x, current.y, 8, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = "#ff3b30";
+      ctx.beginPath();
+      ctx.arc(current.x, current.y, 4.5, 0, Math.PI * 2);
+      ctx.fill();
+    }}
+
+    function draw() {{
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "#080808";
+      ctx.fillRect(0, 0, w, h);
+      drawAxes();
+      drawPath();
+      stats.textContent = `Points: ${{points.length}}  |  X span: ${{spanX.toFixed(1)}} cm  |  Y span: ${{spanY.toFixed(1)}} cm  |  Z span: ${{spanZ.toFixed(1)}} cm`;
+    }}
+
+    canvas.addEventListener("mousedown", (event) => {{
+      dragging = true;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      canvas.classList.add("dragging");
+    }});
+
+    window.addEventListener("mouseup", () => {{
+      dragging = false;
+      canvas.classList.remove("dragging");
+    }});
+
+    window.addEventListener("mousemove", (event) => {{
+      if (!dragging) {{
+        return;
+      }}
+      const dx = event.clientX - lastX;
+      const dy = event.clientY - lastY;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      yaw += dx * 0.01;
+      pitch = Math.max(-1.25, Math.min(1.25, pitch + dy * 0.01));
+      draw();
+    }});
+
+    canvas.addEventListener("wheel", (event) => {{
+      event.preventDefault();
+      const scale = Math.exp(-event.deltaY * 0.001);
+      zoom = Math.max(0.35, Math.min(4.0, zoom * scale));
+      draw();
+    }}, {{ passive: false }});
+
+    window.addEventListener("resize", resize);
+    resize();
+  </script>
+</body>
+</html>
+""",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            append_console = getattr(self, "_append_console", None)
+            if callable(append_console):
+                append_console(f"WARNING: Built-in 3D HTML export failed: {exc}")
+            return False
+        return output_path.exists()
+
+    def _animate_path_head(self) -> None:
+        self.path_breath_phase += 0.35
+        if self.trace_points:
+            self._render_path()
+        self.root.after(80, self._animate_path_head)
 
     def _handle_scan_result(self, payload: Dict[str, object]) -> None:
         interfaces = [str(uri) for uri in payload.get("interfaces", [])]
@@ -921,6 +2148,7 @@ class DashboardApp:
         self.worker = RadioSession(
             preferred_uri=preferred_uri,
             cache_dir=self.args.cache,
+            csv_dir=self.args.csv_dir,
             log_period_ms=self.args.log_period_ms,
             event_queue=self.event_queue,
         )
@@ -942,12 +2170,17 @@ class DashboardApp:
             elif event_type == "scan_result":
                 self._handle_scan_result(payload)
             elif event_type == "mission":
-                self.mission = MissionSnapshot(**payload)
+                mission_snapshot = MissionSnapshot(**payload)
+                self._play_human_sfx(self.last_human_sound_snapshot, mission_snapshot)
+                self.last_human_sound_snapshot = mission_snapshot
+                self.mission = mission_snapshot
                 self._render_mission()
                 self._render_human()
             elif event_type == "flow":
                 self.flow = FlowSnapshot(**payload)
+                self._append_trace_point()
                 self._render_flow()
+                self._render_path()
             elif event_type == "range":
                 self.range = RangeSnapshot(**payload)
                 self._render_mission()
@@ -961,6 +2194,7 @@ class DashboardApp:
         self._render_mission()
         self._render_human()
         self._render_flow()
+        self._render_path()
         self._render_range()
 
     def _render_mission(self) -> None:
@@ -977,17 +2211,13 @@ class DashboardApp:
     def _render_human(self) -> None:
         led_color = human_led_color(self.mission)
         human_text = "HUMAN" if self.mission.human else "NO\nHUMAN"
-        status_text = "Detected" if self.mission.human else "No human"
-        if self.mission.human and self.mission.stable:
-            status_text = "Stable detection"
-        elif self.mission.human and self.mission.fresh:
-            status_text = "Fresh detection"
 
         self.human_led_canvas.itemconfigure("led", fill=led_color)
         self.human_led_canvas.itemconfigure("led_text", text=human_text)
-        self.human_status.configure(text=status_text)
         self.fresh_value.configure(text=f"Fresh: {self.mission.fresh}")
         self.stable_value.configure(text=f"Stable: {self.mission.stable}")
+        uart_color = "#34c82a" if self.mission.fresh else "#d93025"
+        self.uart_status_canvas.itemconfigure("uart_led", fill=uart_color)
         self.max_temp_value.configure(text=f"Max Temp: {self.mission.max_temp_c:.2f} C")
         self.therm_value.configure(text=f"Thermistor: {self.mission.therm_c:.2f} C")
 
@@ -996,6 +2226,12 @@ class DashboardApp:
         self.shutter_value.configure(text=str(self.flow.shutter))
         self.vel_value.configure(text=f"({self.flow.vel_x:.2f}, {self.flow.vel_y:.2f}) m/s")
         self.cmd_value.configure(text=f"({self.flow.cmd_x:.2f}, {self.flow.cmd_y:.2f}) m/s")
+        if self.show_trace_position and self.flow.pos_valid:
+            self.pos_x_value.configure(text=f"{self.flow.pos_x_cm:.1f} cm")
+            self.pos_y_value.configure(text=f"{self.flow.pos_y_cm:.1f} cm")
+        else:
+            self.pos_x_value.configure(text="--")
+            self.pos_y_value.configure(text="--")
         self.flow_age_value.configure(text=f"{self.flow.timestamp_ms} ms")
 
     def _render_range(self) -> None:
@@ -1018,10 +2254,15 @@ class DashboardApp:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tk dashboard for the Crazyflie wall-follow mission")
-    parser.add_argument("--uri", help="Crazyflie link URI. Defaults to usb://0.")
+    parser.add_argument("--uri", help="Crazyflie link URI. If omitted, the dashboard starts disconnected and waits for Scan or manual entry.")
     parser.add_argument("--cache", default="/Users/zhangzehua/Desktop/fyp/cache", help="TOC cache directory")
+    parser.add_argument(
+        "--csv-dir",
+        default=str(SCRIPT_DIR / "telemetry_logs"),
+        help="Directory where realtime telemetry CSV files will be written",
+    )
     parser.add_argument("--log-period-ms", type=int, default=250, help="Telemetry log period in ms")
-    parser.add_argument("--no-auto-connect", dest="auto_connect", action="store_false", help="Open the window without connecting immediately")
+    parser.add_argument("--no-auto-connect", dest="auto_connect", action="store_false", help="Open the window without auto-connecting when --uri is provided")
     parser.set_defaults(auto_connect=True)
     return parser.parse_args()
 

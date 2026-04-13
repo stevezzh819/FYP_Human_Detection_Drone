@@ -5,12 +5,19 @@
 **/build/
 **/dist/
 **/out/
-
+/tools/telemetry_logs
+/REPORT
+/output
+/cache
+/cache312
+/tools/.claude
 # Environment/config artifacts
 *.env
 .venv/
 .venv*/
 venv/
+!.venv-radio/
+!.venv-radio/**
 env/
 ENV/
 **/__pycache__/
