@@ -81,7 +81,7 @@ static const uint32_t HUMAN_PACKET_STALE_TIMEOUT_MS = 300U;  // Defines how long
 
 static const float HUMAN_CONFIRM_TIME = 3.0f;  // Param/Variable for Dashboard Reading
 
-static const float BATTERY_CUTOFF = 2.2f;
+static const float BATTERY_CUTOFF = 2.5f;
 // static const float BATTERY_CUTOFF = 2.0f;
 
 // Push-style avoidance parameters
@@ -99,8 +99,8 @@ bool goLeft = false;
 // bool goLeft = true;
 float distanceToWall = 0.5f;  // Target distance that the Crazyflie tries to maintain from the wall while following it (default is 0.5).
 // float distanceToWall = 0.8f;
-float maxForwardSpeed = 0.25f;
-// float maxForwardSpeed = 0.2f;
+// float maxForwardSpeed = 0.25f;
+float maxForwardSpeed = 0.2f;
 
 // ===================== Python control =====================
 
@@ -915,15 +915,20 @@ void appMain()
 
         float margin = 0.15f;
 
-        if(frontRange > humanStandOff + margin)
-          cmdVelX = 0.15f;
-        else if(frontRange < humanStandOff - margin)
-          cmdVelX = -0.1f;
+        if (frontRange > humanStandOff + margin)
+            cmdVelX = 0.15f;
         else
-        {
-          cmdVelX = 0;
-          missionTransition(mission_bob,timeNow);
-        }
+            missionTransition(mission_bob, timeNow);  // close enough → bob
+
+        // if(frontRange > humanStandOff + margin)
+        //   cmdVelX = 0.15f;
+        // else if(frontRange < humanStandOff - margin)
+        //   cmdVelX = -0.1f;
+        // else
+        // {
+        //   cmdVelX = 0;
+        //   missionTransition(mission_bob,timeNow);
+        // }
       }
       break;
 
