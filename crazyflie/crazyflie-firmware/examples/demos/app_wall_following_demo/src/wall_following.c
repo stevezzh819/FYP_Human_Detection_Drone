@@ -81,8 +81,8 @@ static const uint32_t HUMAN_PACKET_STALE_TIMEOUT_MS = 300U;  // Defines how long
 
 static const float HUMAN_CONFIRM_TIME = 3.0f;  // Param/Variable for Dashboard Reading
 
-static const float BATTERY_CUTOFF = 2.8f;
-// static const float BATTERY_CUTOFF = 2.0f;
+// static const float BATTERY_CUTOFF = 2.8f;
+static const float BATTERY_CUTOFF = 2.5f;
 
 // Push-style avoidance parameters
 // static const float AVOID_RADIUS = 0.4f;   // meters
@@ -99,8 +99,8 @@ bool goLeft = false;
 // bool goLeft = true;
 float distanceToWall = 0.5f;  // Target distance that the Crazyflie tries to maintain from the wall while following it (default is 0.5).
 // float distanceToWall = 0.8f;
-float maxForwardSpeed = 0.25f;
-// float maxForwardSpeed = 0.2f;
+// float maxForwardSpeed = 0.25f;
+float maxForwardSpeed = 0.2f;
 
 // ===================== Python control =====================
 
@@ -265,13 +265,13 @@ static uint8_t getDashboardMissionState(MissionState state)
   case mission_approach:
     return 3U;
   case mission_bob:
-    return 3U;
-  case mission_land:
     return 4U;
-  case mission_transition:
+  case mission_land:
     return 5U;
-  case mission_align:
+  case mission_transition:
     return 6U;
+  case mission_align:
+    return 7U;
   }
 
   return 0U;
@@ -915,15 +915,20 @@ void appMain()
 
         float margin = 0.15f;
 
-        if(frontRange > humanStandOff + margin)
-          cmdVelX = 0.15f;
-        else if(frontRange < humanStandOff - margin)
-          cmdVelX = -0.1f;
+        if (frontRange > humanStandOff + margin)
+            cmdVelX = 0.15f;
         else
-        {
-          cmdVelX = 0;
-          missionTransition(mission_bob,timeNow);
-        }
+            missionTransition(mission_bob, timeNow);  // close enough → bob
+
+        // if(frontRange > humanStandOff + margin)
+        //   cmdVelX = 0.15f;
+        // else if(frontRange < humanStandOff - margin)
+        //   cmdVelX = -0.1f;
+        // else
+        // {
+        //   cmdVelX = 0;
+        //   missionTransition(mission_bob,timeNow);
+        // }
       }
       break;
 
@@ -1053,8 +1058,9 @@ void appMain()
 
     
     /* ===================== SMOOTH OBSTACLE AVOIDANCE (NEW: Only uses right and back sensor. Front and left sensors will be used from wallFollower() library automatically) ===================== */
-    bool holdStill = (missionState == mission_land || missionState == mission_bob || missionState == mission_scan || missionState == mission_align);
-    
+    // bool holdStill = (missionState == mission_land || missionState == mission_bob || missionState == mission_scan || missionState == mission_align);
+
+    bool holdStill = (missionState == mission_bob || missionState == mission_scan || missionState == mission_align);
     if (!holdStill)
     {
         // SGBA-style avoidance: fixed per-axis push when sensor is within save_distance.
